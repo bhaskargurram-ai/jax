@@ -734,6 +734,96 @@ class LaxBackedScipyStatsTests(jtu.JaxTestCase):
                               tol=5e-4)
       self._CompileAndCheck(lax_fun, args_maker)
 
+  @jtu.sample_product(
+    fun=["ppf", "isf"],
+    shapes=itertools.combinations_with_replacement(all_shapes, 4),
+    dtypes=itertools.combinations_with_replacement(jtu.dtypes.floating, 4),
+  )
+  def testGammaQuantile(self, fun, shapes, dtypes):
+    rng_q = jtu.rand_uniform(self.rng())
+    rng = jtu.rand_positive(self.rng())
+    scipy_fun = getattr(osp_stats.gamma, fun)
+    lax_fun = getattr(lsp_stats.gamma, fun)
+
+    def args_maker():
+      q = rng_q(shapes[0], dtypes[0])
+      a, loc, scale = map(rng, shapes[1:], dtypes[1:])
+      return [q, a, loc, scale]
+
+    tol = 5e-4 if jtu.test_device_matches(["cpu"]) else 1e-2
+    with jtu.strict_promotion_if_dtypes_match(dtypes):
+      self._CheckAgainstNumpy(scipy_fun, lax_fun, args_maker, check_dtypes=False,
+                              tol=tol)
+      self._CompileAndCheck(lax_fun, args_maker, rtol=tol)
+
+  @jtu.sample_product(
+    dist=["gamma", "chi2"], fun=["ppf", "isf"], dtype=jtu.dtypes.floating
+  )
+  def testGammaQuantileEdgeCases(self, dist, fun, dtype):
+    # q outside [0, 1] and invalid shape or scale give nan; q in {0, 1} gives
+    # the ends of the support.
+    q = np.array([-0.1, 0.0, 0.3, 1.0, 1.1, np.nan, 0.3, 0.0, 0.3, 1.0, 0.3,
+                  0.3, 0.0, 0.3, 0.3], dtype)
+    a = np.array([2.0, 2.0, 2.0, 2.0, 2.0, 2.0, 0.0, 0.0, -1.0, -1.0, np.nan,
+                  np.inf, np.inf, 2.0, 2.0], dtype)
+    scale = np.array([3.0] * 13 + [0.0, -1.0], dtype)
+    loc = np.array(1.5, dtype)
+    scipy_fun = getattr(getattr(osp_stats, dist), fun)
+    lax_fun = getattr(getattr(lsp_stats, dist), fun)
+    with np.errstate(invalid="ignore"):  # scipy computes inf * 0 for scale=0
+      expected = scipy_fun(q, a, loc, scale)
+    self.assertAllClose(lax_fun(q, a, loc, scale), expected, check_dtypes=False)
+
+  @jtu.sample_product(dist=["gamma", "chi2"], fun=["ppf", "isf"])
+  def testGammaQuantileDebugNans(self, dist, fun):
+    lax_fun = getattr(getattr(lsp_stats, dist), fun)
+    q = np.array([0.0, 0.3, 1.0])
+    with jax.debug_nans(True), jax.disable_jit():
+      lax_fun(q, 2.0, 1.5, 3.0)  # Doesn't raise
+
+  @jtu.sample_product(fun=["ppf", "isf"], dtype=jtu.dtypes.floating)
+  def testGammaQuantileTails(self, fun, dtype):
+    finfo = np.finfo(dtype)
+    a = np.array([1e-3, 0.1, 0.5, 1.0, 4.0, 30.0, 1e3, 1e5])
+    q = np.array([1e-30, 1e-10, 1e-3, 0.1, 0.5, 0.9, 0.999, 1 - 1e-6])
+    a, q = (v.astype(dtype).ravel() for v in np.meshgrid(a, q))
+    scipy_fun = getattr(osp_stats.gamma, fun)
+    lax_fun = getattr(lsp_stats.gamma, fun)
+    expected = scipy_fun(q.astype(np.float64), a.astype(np.float64), 0, 2)
+    # Skip points whose result underflows in `dtype`.
+    keep = expected > 1e3 * float(finfo.tiny)
+    a, q = a[keep], q[keep]
+    if jtu.test_device_matches(["cpu"]):
+      rtol = {np.float32: 5e-3, np.float64: 1e-10}
+    else:
+      rtol = {np.float32: 1e-2, np.float64: 1e-9}
+    args_maker = lambda: [q, a, 0, 2]
+    self._CheckAgainstNumpy(scipy_fun, lax_fun, args_maker, check_dtypes=False,
+                            atol=0, rtol=rtol)
+    self._CompileAndCheck(lax_fun, args_maker, rtol=rtol)
+
+    # The quantile is the inverse of the cdf (or, for isf, of the sf).
+    inverse = lsp_stats.gamma.cdf if fun == "ppf" else lsp_stats.gamma.sf
+    moderate = a <= 1e3
+    a, q = a[moderate], q[moderate]
+    self.assertAllClose(inverse(lax_fun(q, a, 0, 2), a, 0, 2), q,
+                        check_dtypes=False, atol=0,
+                        rtol={np.float32: 2e-3, np.float64: 1e-10})
+
+  @jtu.sample_product(
+    dist=["gamma", "chi2"], fun=["ppf", "isf"], dtype=jtu.dtypes.floating
+  )
+  def testGammaQuantileGrads(self, dist, fun, dtype):
+    q = np.array([0.05, 0.3, 0.5, 0.8, 0.99], dtype)
+    a = np.array([0.5, 1.0, 2.5, 10.0, 40.0], dtype)
+    loc = np.array(1.5, dtype)
+    scale = np.array(2.0, dtype)
+    lax_fun = getattr(getattr(lsp_stats, dist), fun)
+    tol = {np.float32: 5e-2, np.float64: 1e-5}
+    eps = {np.float32: 1e-3, np.float64: 1e-6}[dtype]
+    jtu.check_grads(lax_fun, (q, a, loc, scale), order=1, modes=["fwd", "rev"],
+                    atol=tol, rtol=tol, eps=eps)
+
   @genNamedParametersNArgs(2)
   def testGenNormLogPdf(self, shapes, dtypes):
     rng = jtu.rand_default(self.rng())
@@ -1479,6 +1569,28 @@ class LaxBackedScipyStatsTests(jtu.JaxTestCase):
       self._CheckAgainstNumpy(scipy_fun, lax_fun, args_maker, check_dtypes=False,
                               tol=5e-4)
       self._CompileAndCheck(lax_fun, args_maker)
+
+  @jtu.sample_product(
+    fun=["ppf", "isf"],
+    shapes=itertools.combinations_with_replacement(all_shapes, 4),
+    dtypes=itertools.combinations_with_replacement(jtu.dtypes.floating, 4),
+  )
+  def testChi2Quantile(self, fun, shapes, dtypes):
+    rng_q = jtu.rand_uniform(self.rng())
+    rng = jtu.rand_positive(self.rng())
+    scipy_fun = getattr(osp_stats.chi2, fun)
+    lax_fun = getattr(lsp_stats.chi2, fun)
+
+    def args_maker():
+      q = rng_q(shapes[0], dtypes[0])
+      df, loc, scale = map(rng, shapes[1:], dtypes[1:])
+      return [q, df, loc, scale]
+
+    tol = 5e-4 if jtu.test_device_matches(["cpu"]) else 1e-2
+    with jtu.strict_promotion_if_dtypes_match(dtypes):
+      self._CheckAgainstNumpy(scipy_fun, lax_fun, args_maker, check_dtypes=False,
+                              tol=tol)
+      self._CompileAndCheck(lax_fun, args_maker, rtol=tol)
 
   @genNamedParametersNArgs(5)
   def testBetaBinomLogPmf(self, shapes, dtypes):

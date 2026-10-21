@@ -311,6 +311,8 @@ jax.scipy.stats.chi2
    logcdf
    sf
    logsf
+   ppf
+   isf
 
 
 jax.scipy.stats.dirichlet
@@ -349,6 +351,8 @@ jax.scipy.stats.gamma
    logcdf
    sf
    logsf
+   ppf
+   isf
 
 jax.scipy.stats.gumbel_l
 ~~~~~~~~~~~~~~~~~~~~~~~~

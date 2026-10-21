@@ -19,6 +19,7 @@ from jax._src import numpy as jnp
 from jax._src.lax.lax import _const as _lax_const
 from jax._src.numpy.util import promote_args_inexact
 from jax._src.scipy.special import gammainc, gammaincc, xlogy
+from jax._src.scipy.stats import gamma
 from jax._src.typing import Array, ArrayLike
 
 
@@ -55,6 +56,8 @@ def logpdf(x: ArrayLike, df: ArrayLike, loc: ArrayLike = 0, scale: ArrayLike = 1
     - :func:`jax.scipy.stats.chi2.sf`
     - :func:`jax.scipy.stats.chi2.logcdf`
     - :func:`jax.scipy.stats.chi2.logsf`
+    - :func:`jax.scipy.stats.chi2.ppf`
+    - :func:`jax.scipy.stats.chi2.isf`
   """
   x, df, loc, scale = promote_args_inexact("chi2.logpdf", x, df, loc, scale)
   one = _lax_const(x, 1)
@@ -103,6 +106,8 @@ def pdf(x: ArrayLike, df: ArrayLike, loc: ArrayLike = 0, scale: ArrayLike = 1) -
     - :func:`jax.scipy.stats.chi2.logcdf`
     - :func:`jax.scipy.stats.chi2.logpdf`
     - :func:`jax.scipy.stats.chi2.logsf`
+    - :func:`jax.scipy.stats.chi2.ppf`
+    - :func:`jax.scipy.stats.chi2.isf`
   """
   return lax.exp(logpdf(x, df, loc, scale))
 
@@ -137,6 +142,8 @@ def cdf(x: ArrayLike, df: ArrayLike, loc: ArrayLike = 0, scale: ArrayLike = 1) -
     - :func:`jax.scipy.stats.chi2.logcdf`
     - :func:`jax.scipy.stats.chi2.logpdf`
     - :func:`jax.scipy.stats.chi2.logsf`
+    - :func:`jax.scipy.stats.chi2.ppf`
+    - :func:`jax.scipy.stats.chi2.isf`
   """
   x, df, loc, scale = promote_args_inexact("chi2.cdf", x, df, loc, scale)
   two = _lax_const(scale, 2)
@@ -183,6 +190,8 @@ def logcdf(x: ArrayLike, df: ArrayLike, loc: ArrayLike = 0, scale: ArrayLike = 1
     - :func:`jax.scipy.stats.chi2.sf`
     - :func:`jax.scipy.stats.chi2.logpdf`
     - :func:`jax.scipy.stats.chi2.logsf`
+    - :func:`jax.scipy.stats.chi2.ppf`
+    - :func:`jax.scipy.stats.chi2.isf`
   """
   return lax.log(cdf(x, df, loc, scale))
 
@@ -217,6 +226,8 @@ def sf(x: ArrayLike, df: ArrayLike, loc: ArrayLike = 0, scale: ArrayLike = 1) ->
     - :func:`jax.scipy.stats.chi2.logcdf`
     - :func:`jax.scipy.stats.chi2.logpdf`
     - :func:`jax.scipy.stats.chi2.logsf`
+    - :func:`jax.scipy.stats.chi2.ppf`
+    - :func:`jax.scipy.stats.chi2.isf`
   """
   x, df, loc, scale = promote_args_inexact("chi2.sf", x, df, loc, scale)
   two = _lax_const(scale, 2)
@@ -263,5 +274,72 @@ def logsf(x: ArrayLike, df: ArrayLike, loc: ArrayLike = 0, scale: ArrayLike = 1)
     - :func:`jax.scipy.stats.chi2.sf`
     - :func:`jax.scipy.stats.chi2.logcdf`
     - :func:`jax.scipy.stats.chi2.logpdf`
+    - :func:`jax.scipy.stats.chi2.ppf`
+    - :func:`jax.scipy.stats.chi2.isf`
   """
   return lax.log(sf(x, df, loc, scale))
+
+
+def ppf(q: ArrayLike, df: ArrayLike, loc: ArrayLike = 0, scale: ArrayLike = 1) -> Array:
+  r"""Chi-square percent point function.
+
+  JAX implementation of :obj:`scipy.stats.chi2` ``ppf``.
+
+  The percent point function is defined as the inverse of the
+  cumulative distribution function, :func:`jax.scipy.stats.chi2.cdf`.
+  JAX follows the scipy convention of using ``df`` to denote degrees
+  of freedom.
+
+  Args:
+    q: arraylike, value at which to evaluate the PPF
+    df: arraylike, distribution shape parameter
+    loc: arraylike, distribution offset parameter
+    scale: arraylike, distribution scale parameter
+
+  Returns:
+    array of ppf values.
+
+  See Also:
+    - :func:`jax.scipy.stats.chi2.cdf`
+    - :func:`jax.scipy.stats.chi2.pdf`
+    - :func:`jax.scipy.stats.chi2.sf`
+    - :func:`jax.scipy.stats.chi2.logcdf`
+    - :func:`jax.scipy.stats.chi2.logpdf`
+    - :func:`jax.scipy.stats.chi2.logsf`
+    - :func:`jax.scipy.stats.chi2.isf`
+  """
+  q, df, loc, scale = promote_args_inexact("chi2.ppf", q, df, loc, scale)
+  two = _lax_const(scale, 2)
+  return gamma.ppf(q, lax.div(df, two), loc, lax.mul(scale, two))
+
+
+def isf(q: ArrayLike, df: ArrayLike, loc: ArrayLike = 0, scale: ArrayLike = 1) -> Array:
+  r"""Chi-square inverse survival function.
+
+  JAX implementation of :obj:`scipy.stats.chi2` ``isf``.
+
+  Returns the inverse of the survival function,
+  :func:`jax.scipy.stats.chi2.sf`. JAX follows the scipy
+  convention of using ``df`` to denote degrees of freedom.
+
+  Args:
+    q: arraylike, value at which to evaluate the ISF
+    df: arraylike, distribution shape parameter
+    loc: arraylike, distribution offset parameter
+    scale: arraylike, distribution scale parameter
+
+  Returns:
+    array of isf values.
+
+  See Also:
+    - :func:`jax.scipy.stats.chi2.cdf`
+    - :func:`jax.scipy.stats.chi2.pdf`
+    - :func:`jax.scipy.stats.chi2.sf`
+    - :func:`jax.scipy.stats.chi2.logcdf`
+    - :func:`jax.scipy.stats.chi2.logpdf`
+    - :func:`jax.scipy.stats.chi2.logsf`
+    - :func:`jax.scipy.stats.chi2.ppf`
+  """
+  q, df, loc, scale = promote_args_inexact("chi2.isf", q, df, loc, scale)
+  two = _lax_const(scale, 2)
+  return gamma.isf(q, lax.div(df, two), loc, lax.mul(scale, two))

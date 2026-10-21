@@ -18,7 +18,8 @@ from jax._src import lax
 from jax._src import numpy as jnp
 from jax._src.lax.lax import _const as _lax_const
 from jax._src.numpy.util import promote_args_inexact
-from jax._src.scipy.special import gammaln, xlogy, gammainc, gammaincc
+from jax._src.scipy.special import (
+    gammaln, xlogy, gammainc, gammaincc, gammaincinv, gammainccinv)
 from jax._src.typing import Array, ArrayLike
 
 
@@ -51,6 +52,8 @@ def logpdf(x: ArrayLike, a: ArrayLike, loc: ArrayLike = 0, scale: ArrayLike = 1)
     - :func:`jax.scipy.stats.gamma.sf`
     - :func:`jax.scipy.stats.gamma.logcdf`
     - :func:`jax.scipy.stats.gamma.logsf`
+    - :func:`jax.scipy.stats.gamma.ppf`
+    - :func:`jax.scipy.stats.gamma.isf`
   """
   x, a, loc, scale = promote_args_inexact("gamma.logpdf", x, a, loc, scale)
   ok = lax.ge(x, loc)
@@ -91,6 +94,8 @@ def pdf(x: ArrayLike, a: ArrayLike, loc: ArrayLike = 0, scale: ArrayLike = 1) ->
     - :func:`jax.scipy.stats.gamma.logcdf`
     - :func:`jax.scipy.stats.gamma.logpdf`
     - :func:`jax.scipy.stats.gamma.logsf`
+    - :func:`jax.scipy.stats.gamma.ppf`
+    - :func:`jax.scipy.stats.gamma.isf`
   """
   return lax.exp(logpdf(x, a, loc, scale))
 
@@ -124,6 +129,8 @@ def cdf(x: ArrayLike, a: ArrayLike, loc: ArrayLike = 0, scale: ArrayLike = 1) ->
     - :func:`jax.scipy.stats.gamma.logcdf`
     - :func:`jax.scipy.stats.gamma.logpdf`
     - :func:`jax.scipy.stats.gamma.logsf`
+    - :func:`jax.scipy.stats.gamma.ppf`
+    - :func:`jax.scipy.stats.gamma.isf`
   """
   x, a, loc, scale = promote_args_inexact("gamma.cdf", x, a, loc, scale)
   return gammainc(
@@ -165,6 +172,8 @@ def logcdf(x: ArrayLike, a: ArrayLike, loc: ArrayLike = 0, scale: ArrayLike = 1)
     - :func:`jax.scipy.stats.gamma.sf`
     - :func:`jax.scipy.stats.gamma.logpdf`
     - :func:`jax.scipy.stats.gamma.logsf`
+    - :func:`jax.scipy.stats.gamma.ppf`
+    - :func:`jax.scipy.stats.gamma.isf`
   """
   return lax.log(cdf(x, a, loc, scale))
 
@@ -198,6 +207,8 @@ def sf(x: ArrayLike, a: ArrayLike, loc: ArrayLike = 0, scale: ArrayLike = 1) -> 
     - :func:`jax.scipy.stats.gamma.logcdf`
     - :func:`jax.scipy.stats.gamma.logpdf`
     - :func:`jax.scipy.stats.gamma.logsf`
+    - :func:`jax.scipy.stats.gamma.ppf`
+    - :func:`jax.scipy.stats.gamma.isf`
   """
   x, a, loc, scale = promote_args_inexact("gamma.sf", x, a, loc, scale)
   y = lax.div(lax.sub(x, loc), scale)
@@ -233,5 +244,76 @@ def logsf(x: ArrayLike, a: ArrayLike, loc: ArrayLike = 0, scale: ArrayLike = 1) 
     - :func:`jax.scipy.stats.gamma.sf`
     - :func:`jax.scipy.stats.gamma.logcdf`
     - :func:`jax.scipy.stats.gamma.logpdf`
+    - :func:`jax.scipy.stats.gamma.ppf`
+    - :func:`jax.scipy.stats.gamma.isf`
   """
   return lax.log(sf(x, a, loc, scale))
+
+
+def ppf(q: ArrayLike, a: ArrayLike, loc: ArrayLike = 0, scale: ArrayLike = 1) -> Array:
+  r"""Gamma percent point function.
+
+  JAX implementation of :obj:`scipy.stats.gamma` ``ppf``.
+
+  The percent point function is defined as the inverse of the
+  cumulative distribution function, :func:`jax.scipy.stats.gamma.cdf`.
+
+  Args:
+    q: arraylike, value at which to evaluate the PPF
+    a: arraylike, distribution shape parameter
+    loc: arraylike, distribution offset parameter
+    scale: arraylike, distribution scale parameter
+
+  Returns:
+    array of ppf values.
+
+  See Also:
+    - :func:`jax.scipy.stats.gamma.cdf`
+    - :func:`jax.scipy.stats.gamma.pdf`
+    - :func:`jax.scipy.stats.gamma.sf`
+    - :func:`jax.scipy.stats.gamma.logcdf`
+    - :func:`jax.scipy.stats.gamma.logpdf`
+    - :func:`jax.scipy.stats.gamma.logsf`
+    - :func:`jax.scipy.stats.gamma.isf`
+    - :func:`jax.scipy.special.gammaincinv`
+  """
+  q, a, loc, scale = promote_args_inexact("gamma.ppf", q, a, loc, scale)
+  # Like scipy, return nan for every q when a <= 0 or scale <= 0. gammaincinv
+  # returns nan for a < 0, which avoids a nan constant that would trip
+  # debug_nans with jit disabled.
+  a = jnp.where((a > 0) & (scale > 0), a, -1)
+  return lax.add(lax.mul(gammaincinv(a, q), scale), loc)
+
+
+def isf(q: ArrayLike, a: ArrayLike, loc: ArrayLike = 0, scale: ArrayLike = 1) -> Array:
+  r"""Gamma inverse survival function.
+
+  JAX implementation of :obj:`scipy.stats.gamma` ``isf``.
+
+  Returns the inverse of the survival function,
+  :func:`jax.scipy.stats.gamma.sf`. This is more accurate than
+  ``ppf(1 - q, a, loc, scale)`` when ``q`` is small.
+
+  Args:
+    q: arraylike, value at which to evaluate the ISF
+    a: arraylike, distribution shape parameter
+    loc: arraylike, distribution offset parameter
+    scale: arraylike, distribution scale parameter
+
+  Returns:
+    array of isf values.
+
+  See Also:
+    - :func:`jax.scipy.stats.gamma.cdf`
+    - :func:`jax.scipy.stats.gamma.pdf`
+    - :func:`jax.scipy.stats.gamma.sf`
+    - :func:`jax.scipy.stats.gamma.logcdf`
+    - :func:`jax.scipy.stats.gamma.logpdf`
+    - :func:`jax.scipy.stats.gamma.logsf`
+    - :func:`jax.scipy.stats.gamma.ppf`
+    - :func:`jax.scipy.special.gammainccinv`
+  """
+  q, a, loc, scale = promote_args_inexact("gamma.isf", q, a, loc, scale)
+  # See ppf for the handling of invalid parameters.
+  a = jnp.where((a > 0) & (scale > 0), a, -1)
+  return lax.add(lax.mul(gammainccinv(a, q), scale), loc)

@@ -23,6 +23,9 @@ When releasing, please add the new-release-boilerplate to docs/pallas/CHANGELOG.
   * Added {func}`jax.scipy.special.gammaincinv` and
     {func}`jax.scipy.special.gammainccinv`, the inverses of the regularized
     incomplete gamma functions, with gradients with respect to both arguments.
+  * Added {func}`jax.scipy.stats.gamma.ppf`, {func}`jax.scipy.stats.gamma.isf`,
+    {func}`jax.scipy.stats.chi2.ppf` and {func}`jax.scipy.stats.chi2.isf`
+    ({jax-issue}`#20358`).
 
 * Deprecations
   * The `jax_use_shardy_partitioner` configuration flag is deprecated and is now
