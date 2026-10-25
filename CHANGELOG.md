@@ -43,6 +43,14 @@ When releasing, please add the new-release-boilerplate to docs/pallas/CHANGELOG.
     `max_iterations` was silently ignored and any `eps` raised a `ValueError`.
     Both arguments are now static, so passing a traced value for either raises
     an error.
+  * {func}`jax.scipy.linalg.expm` now uses the scaling-and-squaring algorithm of
+    Al-Mohy and Higham (2009), which chooses the number of squarings from the
+    norms of powers of the input. This fixes large errors for non-normal
+    matrices and for some normal ones ({jax-issue}`#17756`,
+    {jax-issue}`#25987`), and `expm` no longer returns NaN when more than
+    `max_squarings` squarings are needed ({jax-issue}`#26802`):
+    `max_squarings` now only limits the squarings that can be differentiated
+    through, and the derivative is NaN beyond it.
 
 ## JAX 0.12.0.1 (October 23, 2026)
 

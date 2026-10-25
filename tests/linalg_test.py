@@ -2247,6 +2247,165 @@ class ScipyLinalgTest(jtu.JaxTestCase):
       jtu.check_grads(expm, (a,), modes=["fwd", "rev"], order=1, atol=tol,
                       rtol=tol)
 
+  def _expm_reference(self, a):
+    # scipy.linalg.expm in double precision.
+    a = np.asarray(a)
+    return osp.linalg.expm(a.astype(np.complex128 if np.iscomplexobj(a)
+                                    else np.float64))
+
+  def _assertExpmClose(self, actual, expected, rtol):
+    # Relative error in the 1-norm, which is the norm the algorithm controls.
+    actual = np.asarray(actual)
+    self.assertTrue(np.all(np.isfinite(actual)))
+    err = (np.linalg.norm(actual - expected, 1, axis=(-2, -1)) /
+           np.linalg.norm(expected, 1, axis=(-2, -1)))
+    self.assertLessEqual(np.max(err), rtol)
+
+  @jtu.sample_product(
+    b=[1e2, 1e4, 1e6, 1e8, 1e12],
+    dtype=float_types,
+  )
+  def testExpmNonNormal(self, b, dtype):
+    # https://github.com/jax-ml/jax/issues/17756: the number of squarings must
+    # not be chosen from norm(A, 1) alone. Here A @ A = I, so no scaling is
+    # needed however large b is; this used to lose digits and give NaN for
+    # b >= 1e6.
+    a = np.array([[1., b], [0., -1.]], dtype=dtype)
+    expected = np.array([[np.e, b * np.sinh(1.)], [0., 1 / np.e]])
+    eps = np.finfo(dtype).eps
+    self._assertExpmClose(jsp.linalg.expm(a), expected, rtol=10 * eps)
+    self._assertExpmClose(jsp.linalg.expm(a, upper_triangular=True), expected,
+                          rtol=10 * eps)
+
+  @jtu.sample_product(dtype=complex_types)
+  def testExpmIssue25987(self, dtype):
+    # expm(1j * M) for symmetric M with norm ~100 lost accuracy because the
+    # scaled matrix could have twice the norm the Padé approximant allows.
+    rng = np.random.default_rng(0)
+    m = rng.random((50, 2, 2))
+    m = (m + m.mT) / 2 * 1e2
+    a = (1j * m).astype(dtype)
+    eps = np.finfo(dtype).eps
+    self._assertExpmClose(jsp.linalg.expm(a), self._expm_reference(a),
+                          rtol=200 * eps)
+
+  @jtu.skip_on_flag("jax_enable_x64", False)
+  def testExpmIssue26802(self):
+    a = np.array([
+        [-6.00094776e-02, -1.37334693e+09, -1.16936523e+19, 1.00100100e-12],
+        [1.00100100e-12, 0., 0., 0.],
+        [0., 1.00100100e-12, 0., 0.],
+        [0., 0., 0., 0.]])
+    expected = self._expm_reference(a)
+    self._assertExpmClose(jsp.linalg.expm(a), expected, rtol=1e-14)
+    self._assertExpmClose(jsp.linalg.expm(a, max_squarings=1000), expected,
+                          rtol=1e-14)
+
+  @jtu.sample_product(
+    norm=[1e-2, 1., 1e1, 1e2, 1e3, 1e4, 1e6, 1e8],
+    dtype=float_types + complex_types,
+  )
+  def testExpmLargeNorm(self, norm, dtype):
+    # Skew-symmetric (real) or skew-Hermitian (complex) A, so that expm(A) is
+    # unitary and finite for any norm. The relative condition number of expm
+    # grows like norm(A), so the tolerance does too.
+    eps = np.finfo(dtype).eps
+    rtol = 100 * eps * max(1., norm)
+    if rtol > 1e-2:
+      self.skipTest("expm is too ill-conditioned for this dtype")
+    rng = jtu.rand_default(self.rng())
+    a = rng((3, 8, 8), dtype)
+    a = a - a.conj().mT
+    a = a / np.linalg.norm(a, 1, axis=(-2, -1), keepdims=True) * norm
+    self._assertExpmClose(jsp.linalg.expm(a.astype(dtype)),
+                          self._expm_reference(a), rtol=rtol)
+
+  @jtu.sample_product(dtype=float_types + complex_types)
+  def testExpmBatchedMixedNorms(self, dtype):
+    # Matrices in one batch that need different numbers of squarings.
+    rng = jtu.rand_default(self.rng())
+    norms = np.array([1e-3, 0.5, 2., 30., 500., 1e4]).reshape(2, 3, 1, 1)
+    a = rng((2, 3, 6, 6), dtype)
+    a = a - a.conj().mT
+    a = (a / np.linalg.norm(a, 1, axis=(-2, -1), keepdims=True) * norms)
+    a = a.astype(dtype)
+    eps = np.finfo(dtype).eps
+    expected = self._expm_reference(a)
+    rtol = 100 * eps * 1e4
+    self._assertExpmClose(jsp.linalg.expm(a), expected, rtol=rtol)
+    self._assertExpmClose(jax.vmap(jax.vmap(jsp.linalg.expm))(a), expected,
+                          rtol=rtol)
+    self._assertExpmClose(jax.jit(jsp.linalg.expm)(a), expected, rtol=rtol)
+
+  @jtu.sample_product(
+    norm=[10., 1e3],
+    dtype=float_types + complex_types,
+  )
+  def testExpmGradLargeNorm(self, norm, dtype):
+    # Inputs that need squaring. Compare the JVP with scipy's Frechet
+    # derivative, and check that the VJP is its transpose.
+    rng = jtu.rand_default(self.rng())
+    a = rng((5, 5), dtype)
+    a = a - a.conj().T
+    a = (a / np.linalg.norm(a, 1) * norm).astype(dtype)
+    e = rng((5, 5), dtype)
+    ct = rng((5, 5), dtype)
+    eps = np.finfo(dtype).eps
+    expm_a, expm_dot = jvp(jsp.linalg.expm, (a,), (e,))
+    ref_a, ref_dot = osp.linalg.expm_frechet(
+        a.astype(np.complex128), e.astype(np.complex128))
+    self._assertExpmClose(expm_a, ref_a, rtol=100 * eps * norm)
+    self._assertExpmClose(expm_dot, ref_dot, rtol=100 * eps * norm)
+    _, vjp_fun = jax.vjp(jsp.linalg.expm, a)
+    ct_a, = vjp_fun(ct)
+    # JAX's VJP is the transpose of the JVP: sum(ct * J e) == sum(J^T ct * e).
+    lhs = np.sum(np.asarray(ct, np.complex128) * np.asarray(expm_dot))
+    rhs = np.sum(np.asarray(ct_a, np.complex128) * e)
+    self.assertLessEqual(abs(lhs - rhs), 100 * eps * norm * abs(lhs))
+    if eps < 1e-10:
+      jtu.check_grads(jsp.linalg.expm, (a,), modes=["fwd", "rev"], order=1,
+                      atol=1e-5, rtol=1e-5)
+
+  @jtu.sample_product(dtype=float_types + complex_types)
+  def testExpmGradBatched(self, dtype):
+    # Reverse mode through the batched (vmapped) squaring loop, with matrices
+    # that need different numbers of squarings.
+    rng = jtu.rand_default(self.rng())
+    a = rng((3, 4, 4), dtype)
+    a = a - a.conj().mT
+    norms = np.array([0.1, 5., 100.]).reshape(3, 1, 1)
+    a = (a / np.linalg.norm(a, 1, axis=(-2, -1), keepdims=True) * norms)
+    a = a.astype(dtype)
+    tol = {np.float32: 1e-1, np.complex64: 1e-1,
+           np.float64: 1e-5, np.complex128: 1e-5}
+    eps = 1e-3 if np.finfo(dtype).bits < 64 else None
+    jtu.check_grads(jsp.linalg.expm, (a,), modes=["rev"], order=1,
+                    atol=tol, rtol=tol, eps=eps)
+    f = lambda a: jnp.sum(jsp.linalg.expm(a)).real
+    g = jax.grad(f)(a)
+    self.assertAllClose(jax.vmap(jax.grad(f))(a), g)
+    self.assertAllClose(jax.grad(lambda a: jnp.sum(jax.vmap(f)(a)))(a), g)
+
+  @jtu.sample_product(shape=[(0, 0), (3, 0, 0)], dtype=float_types)
+  def testExpmEmpty(self, shape, dtype):
+    a = np.zeros(shape, dtype)
+    self.assertArraysEqual(jsp.linalg.expm(a), a)
+
+  @jtu.sample_product(dtype=float_types)
+  def testExpmMaxSquarings(self, dtype):
+    # max_squarings only limits differentiation: the value does not depend on
+    # it, and the derivative is NaN if more squarings are needed.
+    a = np.array([[0., 100.], [-100., 0.]], dtype=dtype)  # needs 5 squarings
+    expected = jsp.linalg.expm(a)
+    self.assertAllClose(jsp.linalg.expm(a, max_squarings=0), expected)
+    self.assertAllClose(jsp.linalg.expm(a, max_squarings=100), expected)
+    t = np.ones_like(a)
+    val, tangent = jvp(partial(jsp.linalg.expm, max_squarings=2), (a,), (t,))
+    self.assertAllClose(val, expected)
+    self.assertTrue(np.all(np.isnan(tangent)))
+    _, tangent = jvp(partial(jsp.linalg.expm, max_squarings=16), (a,), (t,))
+    self.assertTrue(np.all(np.isfinite(tangent)))
+
   @jtu.sample_product(
       shape=[(4, 4), (15, 15), (50, 50), (100, 100)],
       dtype=float_types + complex_types,

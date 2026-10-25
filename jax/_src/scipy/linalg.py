@@ -24,6 +24,7 @@ import warnings
 import numpy as np
 
 from jax._src import config
+from jax._src import custom_derivatives
 from jax._src import dtypes
 from jax._src import lax
 from jax._src import numpy as jnp
@@ -32,6 +33,7 @@ from jax._src.api import jit, vmap, jvp
 from jax._src.lax import linalg as lax_linalg
 from jax._src.numpy import linalg as jnp_linalg
 from jax._src.numpy import vectorize as jnp_vectorize
+from jax._src.numpy.ufuncs import frexp, ldexp
 from jax._src.numpy.util import (
     check_arraylike, ensure_arraylike, promote_dtypes, promote_dtypes_inexact,
     promote_dtypes_complex, promote_args_inexact)
@@ -1436,17 +1438,34 @@ def expm(A: ArrayLike, *, upper_triangular: bool = False, max_squarings: int = 1
   Args:
     A: array of shape ``(..., N, N)``
     upper_triangular: if True, then assume that ``A`` is upper-triangular. Default=False.
-    max_squarings: The number of squarings in the scaling-and-squaring approximation method
-     (default: 16).
+    max_squarings: the number of squarings that support differentiation
+      (default: 16). More squarings are computed if needed, but the derivative
+      of ``expm`` is then NaN. See Notes.
 
   Returns:
     An array of shape ``(..., N, N)`` containing the matrix exponent of ``A``.
 
   Notes:
-    This uses the scaling-and-squaring approximation method, with computational complexity
-    controlled by the optional ``max_squarings`` argument. Theoretically, the number of
-    required squarings is ``max(0, ceil(log2(norm(A))) - c)`` where ``norm(A)`` is the L1
-    norm and ``c=2.42`` for float64/complex128, or ``c=1.97`` for float32/complex64.
+    This uses the scaling-and-squaring algorithm of Al-Mohy and Higham [1]_:
+    ``expm(A) = r(2**-s A)**(2**s)``, where ``r`` is a diagonal Padé
+    approximant and the number of squarings ``s`` is chosen from the norms
+    ``norm(A**k, 1)**(1/k)`` rather than from ``norm(A, 1)`` alone. For
+    non-normal matrices this can need far fewer squarings than the norm of
+    ``A`` suggests, which avoids the loss of accuracy caused by overscaling.
+
+    The first ``max_squarings`` squarings are computed in a loop of static
+    length, which supports reverse-mode differentiation; any further squarings
+    are computed in a loop of dynamic length, which does not. So the value of
+    ``expm`` does not depend on ``max_squarings``, but if more than
+    ``max_squarings`` squarings are needed its derivative is NaN; increase
+    ``max_squarings`` to differentiate such inputs. The number of squarings is
+    at most ``max(0, ceil(log2(norm(A, 1) / c)))`` with ``c = 4.25`` for
+    float64/complex128 and ``c = 3.93`` for float32/complex64, and can be much
+    smaller for non-normal matrices.
+
+    .. [1] A. H. Al-Mohy and N. J. Higham, "A New Scaling and Squaring Algorithm
+       for the Matrix Exponential", SIAM J. Matrix Anal. Appl. 31(3):970-989,
+       2009. https://doi.org/10.1137/09074721X
 
   See Also:
     :func:`jax.scipy.linalg.expm_frechet`
@@ -1482,56 +1501,139 @@ def expm(A: ArrayLike, *, upper_triangular: bool = False, max_squarings: int = 1
   if A.ndim < 2 or A.shape[-1] != A.shape[-2]:
     raise ValueError(f"Expected A to be a (batched) square matrix, got {A.shape=}.")
 
-  if A.ndim > 2:
-    return jnp_vectorize.vectorize(
-      partial(expm, upper_triangular=upper_triangular, max_squarings=max_squarings),
-      signature="(n,n)->(n,n)")(A)
+  if A.shape[-1] == 0:
+    return A
 
-  P, Q, n_squarings = _calc_P_Q(jnp.asarray(A))
+  # For batched input, the squarings run for the whole batch, as many times
+  # as the matrix that needs most squarings requires (see _squaring).
+  P, Q, n_squarings = jnp_vectorize.vectorize(
+      _calc_P_Q, signature="(n,n)->(n,n),(n,n),()")(jnp.asarray(A))
+  R = _solve_P_Q(P, Q, upper_triangular)
+  return _squaring(R, n_squarings, max_squarings)
 
-  def _nan(args):
-    A, *_ = args
-    return jnp.full_like(A, np.nan)
-
-  def _compute(args):
-    A, P, Q = args
-    R = _solve_P_Q(P, Q, upper_triangular)
-    R = _squaring(R, n_squarings, max_squarings)
-    return R
-
-  R = lax.cond(n_squarings > max_squarings, _nan, _compute, (A, P, Q))
-  return R
+# Parameters of the scaling-and-squaring algorithm. theta[m] is the largest
+# value of the scaled norm for which the degree-m Padé approximant has a
+# backward error below the unit roundoff (Higham 2005, Table 2.3 and Al-Mohy &
+# Higham 2009, Table 3.1); 4.25 is used in place of 5.37 for m = 13, as in
+# Al-Mohy & Higham (2009), because it gives a better conditioned denominator.
+# _PADE_ERR_COEF[m] is 1 / |c_{2m+1}|, the reciprocal of the leading coefficient
+# of the backward error series, used by the ell(A, m) correction.
+_EXPM_THETA_DOUBLE = (1.495585217958292e-002, 2.539398330063230e-001,
+                      9.504178996162932e-001, 2.097847961257068e+000, 4.25)
+_EXPM_THETA_SINGLE = (4.258730016922831e-001, 1.880152677804762e+000,
+                      3.925724783138660e+000)
+_PADE_ERR_COEF = {7: 4487938430976000., 13: 113250775606021113483283660800000000.}
 
 @jit
 def _calc_P_Q(A: Array) -> tuple[Array, Array, Array]:
   if A.ndim != 2 or A.shape[0] != A.shape[1]:
     raise ValueError('expected A to be a square matrix')
-  A_L1 = jnp_linalg.norm(A,1)
-  n_squarings: Array
-  U: Array
-  V: Array
+  A_L1 = jnp_linalg.norm(A, 1)
   if A.dtype == 'float64' or A.dtype == 'complex128':
-   maxnorm = 5.371920351148152
-   n_squarings = jnp.maximum(0, jnp.floor(jnp.log2(A_L1 / maxnorm)))
-   A = A / 2 ** n_squarings.astype(A.dtype)
-   conds = jnp.array([1.495585217958292e-002, 2.539398330063230e-001,
-                      9.504178996162932e-001, 2.097847961257068e+000],
-                      dtype=A_L1.dtype)
-   idx = jnp.digitize(A_L1, conds)
-   U, V = lax.switch(idx, [_pade3, _pade5, _pade7, _pade9, _pade13], A)
+    # If norm(A, 1) <= theta[m] for m <= 9, the degree-m approximant needs no
+    # scaling (Higham 2005); otherwise use degree 13 with scaling.
+    *conds, theta = _EXPM_THETA_DOUBLE
+    pades = [_pade3, _pade5, lambda A: _pade7(A, *_even_powers(A)), _pade9]
+    scaled = partial(_scaled_pade, m=13, theta=theta, unit_roundoff=2.0 ** -53)
   elif A.dtype == 'float32' or A.dtype == 'complex64':
-    maxnorm = 3.925724783138660
-    n_squarings = jnp.maximum(0, jnp.floor(jnp.log2(A_L1 / maxnorm)))
-    A = A / 2 ** n_squarings.astype(A.dtype)
-    conds = jnp.array([4.258730016922831e-001, 1.880152677804762e+000],
-                      dtype=A_L1.dtype)
-    idx = jnp.digitize(A_L1, conds)
-    U, V = lax.switch(idx, [_pade3, _pade5, _pade7], A)
+    *conds, theta = _EXPM_THETA_SINGLE
+    pades = [_pade3, _pade5]
+    scaled = partial(_scaled_pade, m=7, theta=theta, unit_roundoff=2.0 ** -24)
   else:
     raise TypeError(f"A.dtype={A.dtype} is not supported.")
+  def unscaled(pade):
+    return lambda A, A_L1: (*pade(A), jnp.zeros((), np.int32))
+  idx = sum((A_L1 >= c).astype(np.int32) for c in conds)
+  U, V, n_squarings = lax.switch(idx, [*map(unscaled, pades), scaled], A, A_L1)
   P = U + V  # p_m(A) : numerator
   Q = -U + V # q_m(A) : denominator
   return P, Q, n_squarings
+
+def _scale_pow2(X: Array, k: Array) -> Array:
+  # X * 2**k, exact unless the result overflows or underflows. 2**k is applied
+  # in two factors so that each factor is a representable number.
+  one = jnp.ones((), X.real.dtype)
+  k1 = k // 2
+  return X * ldexp(one, k1).astype(X.dtype) * ldexp(one, k - k1).astype(X.dtype)
+
+def _normalize(X: Array, X_L1: Array | None = None
+               ) -> tuple[Array, Array, Array]:
+  # Write X = M * 2**e with norm(M, 1) in [0.5, 1). Returns M, e and
+  # log2(norm(X, 1)).
+  if X_L1 is None:
+    X_L1 = jnp_linalg.norm(X, 1)
+  mant, e = frexp(lax.stop_gradient(X_L1))
+  return _scale_pow2(X, -e), e, jnp.log2(mant) + e.astype(mant.dtype)
+
+def _normalized_dot(X: Array, ex: Array, Y: Array, ey: Array
+                    ) -> tuple[Array, Array, Array]:
+  # Product of X * 2**ex and Y * 2**ey in the representation of _normalize.
+  M, e, log2_norm = _normalize(_precise_dot(X, Y))
+  return M, e + ex + ey, log2_norm + (ex + ey).astype(log2_norm.dtype)
+
+def _log2_norm_abs_power(M: Array, e: Array, p: int) -> Array:
+  # log2(norm(abs(A)**p, 1)) for A = M * 2**e. For a nonnegative matrix B,
+  # norm(B**p, 1) = max(ones @ B**p), which takes p vector-matrix products.
+  B = lax.stop_gradient(jnp.abs(M))
+  def body(_, carry):
+    v, log2_scale = carry
+    v = _precise_dot(v, B)
+    _, k = frexp(jnp.max(v))
+    return _scale_pow2(v, -k), log2_scale + k
+  v, log2_scale = lax.fori_loop(
+      0, p, body, (jnp.ones(B.shape[0], B.dtype), p * e))
+  return jnp.log2(jnp.max(v)) + log2_scale.astype(v.dtype)
+
+def _scaled_pade(A: Array, A_L1: Array, *, m: int, theta: float,
+                 unit_roundoff: float) -> tuple[Array, Array, Array]:
+  # Padé approximant of degree m (7 or 13) to exp(2**-s A), with the number of
+  # squarings s chosen as in Al-Mohy & Higham (2009), Algorithm 5.1.
+  # Powers of A are kept as M * 2**e (see _normalize), so that their norms can
+  # be computed without overflow or underflow; they are scaled by 2**-s
+  # exactly once s is known.
+  M1, e1, l1 = _normalize(A, A_L1)
+  M2, e2, l2 = _normalized_dot(M1, e1, M1, e1)
+  M4, e4, l4 = _normalized_dot(M2, e2, M2, e2)
+  M6, e6, l6 = _normalized_dot(M4, e4, M2, e2)
+  # The ell(2**-s A, m) correction of Al-Mohy & Higham (2009) adds squarings
+  # when the leading term of the backward error, bounded using abs(A), exceeds
+  # the unit roundoff. Since the bound scales as 2**(-2 m s), the corrected
+  # number of squarings is max(s, s_ell) with s_ell computed from A itself.
+  log2_alpha = (_log2_norm_abs_power(M1, e1, 2 * m + 1) - l1
+                - math.log2(_PADE_ERR_COEF[m]))
+  s_ell = jnp.maximum(
+      jnp.ceil((log2_alpha - math.log2(unit_roundoff)) / (2 * m)), 0)
+  # s is the smallest integer with 2**-s eta <= theta, where
+  # eta = min(max(d6, d8), max(d8, d10)) and d_k = norm(A**k, 1)**(1/k).
+  # Since eta <= norm(A, 1), this never needs more squarings than the
+  # classical choice based on norm(A, 1), and it can need far fewer for
+  # non-normal A. Work with log2(d_k) = l_k / k.
+  def squarings(d8, d10):
+    log2_eta = jnp.minimum(jnp.maximum(l6 / 6, d8), jnp.maximum(d8, d10))
+    return jnp.ceil(log2_eta - math.log2(theta))
+  # A**8 and A**10 are only needed for their norms. Skip computing them when
+  # the upper bounds norm(A**8) <= norm(A**4)**2, norm(A**2) * norm(A**6) and
+  # norm(A**10) <= norm(A**4) * norm(A**6) already show that s_ell decides s.
+  d8_bound = jnp.minimum(l4 / 4, (l2 + l6) / 8)
+  d10_bound = (l4 + l6) / 10
+  def exact_d8_d10(M4, M6):
+    _, _, l8 = _normalized_dot(M4, e4, M4, e4)
+    _, _, l10 = _normalized_dot(M4, e4, M6, e6)
+    return l8 / 8, l10 / 10
+  d8, d10 = lax.cond(squarings(d8_bound, d10_bound) > s_ell, exact_d8_d10,
+                     lambda *_: (d8_bound, d10_bound),
+                     lax.stop_gradient(M4), lax.stop_gradient(M6))
+  s = jnp.maximum(squarings(d8, d10), s_ell)
+  # s is not finite for inputs with infinite or NaN entries. The upper limit
+  # is never reached for finite inputs and keeps the squaring loop bounded.
+  max_s = 2 * dtypes.finfo(A.dtype).maxexp
+  s = jnp.where(jnp.isfinite(s), jnp.minimum(s, max_s), 0).astype(np.int32)
+  X1 = _scale_pow2(M1, e1 - s)
+  X2 = _scale_pow2(M2, e2 - 2 * s)
+  X4 = _scale_pow2(M4, e4 - 4 * s)
+  X6 = _scale_pow2(M6, e6 - 6 * s)
+  U, V = (_pade13 if m == 13 else _pade7)(X1, X2, X4, X6)
+  return U, V, s
 
 def _solve_P_Q(P: ArrayLike, Q: ArrayLike, upper_triangular: bool = False) -> Array:
   if upper_triangular:
@@ -1542,20 +1644,49 @@ def _solve_P_Q(P: ArrayLike, Q: ArrayLike, upper_triangular: bool = False) -> Ar
 def _precise_dot(A: ArrayLike, B: ArrayLike) -> Array:
   return jnp.dot(A, B, precision=lax.Precision.HIGHEST)
 
+def _matmul(A: Array, B: Array) -> Array:
+  return jnp.matmul(A, B, precision=lax.Precision.HIGHEST)
+
 @jit(static_argnums=2)
 def _squaring(R: Array, n_squarings: Array, max_squarings: int) -> Array:
-  # squaring step to undo scaling
-  def _squaring_precise(x):
-    return _precise_dot(x, x)
-
-  def _identity(x):
-    return x
-
+  # squaring step to undo scaling: R[i] ** (2 ** n_squarings[i]) for each
+  # matrix R[i] in the batch. The first max_squarings squarings use a loop of
+  # static length, which supports reverse-mode differentiation; each step is
+  # skipped once no matrix in the batch needs it.
   def _scan_f(c, i):
-    return lax.cond(i < n_squarings, _squaring_precise, _identity, c), None
+    needed = i < n_squarings
+    if needed.ndim:
+      square = lambda c: jnp.where(needed[..., None, None], _matmul(c, c), c)
+    else:
+      square = lambda c: _matmul(c, c)
+    return lax.cond(jnp.any(needed), square, lambda c: c, c), None
   res, _ = lax.scan(_scan_f, R, jnp.arange(max_squarings, dtype=n_squarings.dtype))
 
-  return res
+  return _extra_squarings(res, n_squarings - max_squarings)
+
+@custom_derivatives.custom_jvp
+def _extra_squarings(R: Array, n: Array) -> Array:
+  # R[i] ** (2 ** n[i]), or R[i] if n[i] <= 0. The loop has dynamic length, so
+  # it is not differentiable; the derivative is defined to be NaN if n > 0.
+  def body(carry):
+    i, R = carry
+    return i + 1, jnp.where((i < n)[..., None, None], _matmul(R, R), R)
+  _, R = lax.while_loop(lambda carry: carry[0] < jnp.max(n), body,
+                        (jnp.zeros((), n.dtype), R))
+  return R
+
+@_extra_squarings.defjvp
+def _extra_squarings_jvp(primals, tangents):
+  R, n = primals
+  R_dot, _ = tangents
+  mask = jnp.where(n > 0, np.nan, 1).astype(R_dot.dtype)[..., None, None]
+  return _extra_squarings(R, n), R_dot * mask
+
+def _even_powers(A: Array) -> tuple[Array, Array, Array]:
+  A2 = _precise_dot(A, A)
+  A4 = _precise_dot(A2, A2)
+  A6 = _precise_dot(A4, A2)
+  return A2, A4, A6
 
 def _pade3(A: Array) -> tuple[Array, Array]:
   b = (120., 60., 12., 1.)
@@ -1576,13 +1707,10 @@ def _pade5(A: Array) -> tuple[Array, Array]:
   V: Array = b[4]*A4 + b[2]*A2 + b[0]*ident
   return U, V
 
-def _pade7(A: Array) -> tuple[Array, Array]:
+def _pade7(A: Array, A2: Array, A4: Array, A6: Array) -> tuple[Array, Array]:
   b = (17297280., 8648640., 1995840., 277200., 25200., 1512., 56., 1.)
   M, N = A.shape
   ident = jnp.eye(M, N, dtype=A.dtype)
-  A2 = _precise_dot(A, A)
-  A4 = _precise_dot(A2, A2)
-  A6 = _precise_dot(A4, A2)
   U = _precise_dot(A, b[7]*A6 + b[5]*A4 + b[3]*A2 + b[1]*ident)
   V = b[6]*A6 + b[4]*A4 + b[2]*A2 + b[0]*ident
   return U,V
@@ -1600,15 +1728,12 @@ def _pade9(A: Array) -> tuple[Array, Array]:
   V = b[8]*A8 + b[6]*A6 + b[4]*A4 + b[2]*A2 + b[0]*ident
   return U,V
 
-def _pade13(A: Array) -> tuple[Array, Array]:
+def _pade13(A: Array, A2: Array, A4: Array, A6: Array) -> tuple[Array, Array]:
   b = (64764752532480000., 32382376266240000., 7771770303897600.,
        1187353796428800., 129060195264000., 10559470521600., 670442572800.,
        33522128640., 1323241920., 40840800., 960960., 16380., 182., 1.)
   M, N = A.shape
   ident = jnp.eye(M, N, dtype=A.dtype)
-  A2 = _precise_dot(A, A)
-  A4 = _precise_dot(A2, A2)
-  A6 = _precise_dot(A4, A2)
   U = _precise_dot(A, _precise_dot(A6, b[13]*A6 + b[11]*A4 + b[9]*A2) + b[7]*A6 + b[5]*A4 + b[3]*A2 + b[1]*ident)
   V = _precise_dot(A6, b[12]*A6 + b[10]*A4 + b[8]*A2) + b[6]*A6 + b[4]*A4 + b[2]*A2 + b[0]*ident
   return U,V
