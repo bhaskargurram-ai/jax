@@ -18,6 +18,7 @@ from collections.abc import Hashable, Sequence
 from functools import partial
 import math
 from operator import index
+import statistics
 import typing
 import warnings
 
@@ -25,6 +26,7 @@ import numpy as np
 
 from jax._src import config
 from jax._src import core
+from jax._src import custom_batching
 from jax._src import dispatch
 from jax._src import dtypes
 from jax._src import numpy as jnp
@@ -43,6 +45,7 @@ from jax._src.lax import special as lax_special
 from jax._src.numpy import einsum as jnp_einsum
 from jax._src.numpy import linalg as jnp_linalg
 from jax._src.numpy.util import _arraylike, check_arraylike, promote_dtypes_inexact
+from jax._src.scipy import special as jsp_special
 from jax._src.pjit import auto_axes
 from jax._src.sharding_impls import canonicalize_sharding
 from jax._src.typing import Array, ArrayLike, DType, DTypeLike
@@ -1128,11 +1131,51 @@ def truncated_normal(key: Key | ArrayLike,  # TODO(jakevdp): make this Key
   if not dtypes.issubdtype(dtype, np.floating):
     raise ValueError(f"dtype argument to `truncated_normal` must be a float "
                      f"dtype, got {dtype}")
-  return maybe_auto_axes(_truncated_normal, out_sharding,
-                         shape=shape, dtype=dtype)(key, lower, upper)
+  # When the bounds are known at trace time, decide then whether any interval
+  # needs the log-space method (see `_truncated_normal`), so that the common
+  # case compiles to the plain `erf` inversion.
+  tails = None
+  if all(isinstance(x, (int, float, np.ndarray, np.generic))
+         for x in (lower, upper)):
+    lower_np, upper_np = np.asarray(lower, dtype), np.asarray(upper, dtype)
+    try:
+      near = np.minimum(upper_np, -lower_np)
+    except ValueError:
+      pass  # Incompatible shapes; `_truncated_normal` raises the error.
+    else:
+      tails = bool(np.any(near < _tail_threshold(dtype)))
+  return maybe_auto_axes(_truncated_normal, out_sharding, shape=shape,
+                         dtype=dtype, tails=tails)(key, lower, upper)
 
-@jit(static_argnums=(3, 4))
-def _truncated_normal(key: Key, lower, upper, shape, dtype) -> Array:
+
+def _tail_threshold(dtype: DType) -> np.ndarray:
+  # An interval is in a tail if it does not contain zero and the normal tail
+  # probability beyond its bound closer to zero is below sqrt(eps), i.e. if
+  # `min(upper, -lower) < ndtri(sqrt(eps))`. For all other intervals,
+  # inverting `erf` keeps at least half of the precision bits.
+  return np.array(statistics.NormalDist().inv_cdf(
+      math.sqrt(float(dtypes.finfo(dtype).eps))), dtype)
+
+
+@custom_batching.custom_vmap
+def _any_unbatched(x: Array) -> Array:
+  return jnp.any(x)
+
+
+@_any_unbatched.def_vmap
+def _any_unbatched_vmap(axis_size, in_batched, x):
+  # Reduce over the batch too, so that under vmap `_truncated_normal` keeps a
+  # `cond` (rather than evaluating both branches for every element) when no
+  # interval in the batch needs the log-space method. This is valid because
+  # the log-space branch returns the same values as the `erf` branch for
+  # non-tail intervals.
+  del axis_size, in_batched
+  return jnp.any(x), False
+
+
+@jit(static_argnums=(3, 4, 5))
+def _truncated_normal(key: Key, lower, upper, shape, dtype,
+                      tails: bool | None = None) -> Array:
   if shape is None:
     shape = lax.broadcast_shapes(np.shape(lower), np.shape(upper))
   else:
@@ -1141,12 +1184,61 @@ def _truncated_normal(key: Key, lower, upper, shape, dtype) -> Array:
   sqrt2 = np.array(np.sqrt(2), dtype)
   lower = lax.convert_element_type(lower, dtype)
   upper = lax.convert_element_type(upper, dtype)
-  a = lax_special.erf(lower / sqrt2)
-  b = lax_special.erf(upper / sqrt2)
   if not dtypes.issubdtype(dtype, np.floating):
     raise TypeError("truncated_normal only accepts floating point dtypes.")
-  u = uniform(key, shape, dtype, minval=a, maxval=b)
-  out = sqrt2 * lax_special.erf_inv(u)
+  lower = lax.broadcast_to_rank(lower, len(shape))
+  upper = lax.broadcast_to_rank(upper, len(shape))
+
+  def erf_inversion(lower, upper):
+    a = lax_special.erf(lower / sqrt2)
+    b = lax_special.erf(upper / sqrt2)
+    u = uniform(key, shape, dtype, minval=a, maxval=b)
+    return sqrt2 * lax_special.erf_inv(u)
+
+  # Inverting `erf` loses precision once the whole interval lies in one tail,
+  # because `erf(lower / sqrt2)` and `erf(upper / sqrt2)` both round towards
+  # +/-1. Far enough out they round to the same value and every sample lands
+  # on a bound (https://github.com/jax-ml/jax/issues/10951). For such
+  # intervals, reflect into the lower tail (where the normal CDF keeps full
+  # relative precision) and invert the CDF in log space instead. All other
+  # intervals keep the `erf` inversion, which is cheaper and leaves their
+  # samples unchanged.
+  if tails is False:
+    out = erf_inversion(lower, upper)
+  else:
+    is_tail = lax.min(upper, -lower) < _tail_threshold(dtype)
+
+    def log_space_inversion(lower, upper):
+      ctype = np.float64 if dtype == np.float64 else np.float32
+      # Elements that use the other method get dummy bounds, so that neither
+      # method computes non-finite values or gradients for them.
+      out_erf = erf_inversion(jnp.where(is_tail, -1, lower),
+                              jnp.where(is_tail, 1, upper))
+      reflect = -lower < upper
+      a = jnp.where(reflect, -upper, lower).astype(ctype)
+      b = jnp.where(reflect, -lower, upper).astype(ctype)
+      a = jnp.where(is_tail, a, -2)
+      b = jnp.where(is_tail, b, -1)
+      a_is_neginf = a == -np.inf
+      log_cdf_a = jnp.where(
+          a_is_neginf, -np.inf,
+          jsp_special.log_ndtr(jnp.where(a_is_neginf, b - 1, a)))
+      log_cdf_b = jsp_special.log_ndtr(b)
+      # Sample p uniformly from (ndtr(a), ndtr(b)], computing log(p) as
+      # log(ndtr(b) - u * (ndtr(b) - ndtr(a))) without leaving log space.
+      u = uniform(key, shape, dtype).astype(ctype)
+      log_p = log_cdf_b + jnp.log1p(u * jnp.expm1(log_cdf_a - log_cdf_b))
+      x = jsp_special.ndtri_exp(log_p)
+      out_tail = jnp.where(reflect, -x, x).astype(dtype)
+      return jnp.where(is_tail, out_tail, out_erf)
+
+    if tails:
+      out = log_space_inversion(lower, upper)
+    else:
+      # The bounds are only known at run time.
+      out = lax_control_flow.cond(
+          _any_unbatched(is_tail), log_space_inversion, erf_inversion,
+          lower, upper)
   # Clamp the value to the open interval (lower, upper) to make sure that
   # rounding (or if we chose `a` for `u`) doesn't push us outside of the range.
   return jnp.clip(

@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import math
+
 import numpy as np
 
 from jax._src import api
@@ -19,7 +21,7 @@ from jax._src import lax
 from jax._src import numpy as jnp
 from jax._src.numpy.util import promote_args_inexact
 from jax._src.scipy.stats import norm
-from jax._src.scipy.special import logsumexp, log_ndtr, ndtr
+from jax._src.scipy.special import logsumexp, log_ndtr, ndtr, ndtri_exp
 from jax._src.typing import Array, ArrayLike
 
 
@@ -332,3 +334,68 @@ def cdf(
     - :func:`jax.scipy.stats.truncnorm.logsf`
   """
   return lax.exp(logcdf(x, a, b, loc, scale))
+
+
+@api.jit
+def ppf(
+  q: ArrayLike,
+  a: ArrayLike,
+  b: ArrayLike,
+  loc: ArrayLike = 0,
+  scale: ArrayLike = 1,
+) -> Array:
+  r"""Truncated normal percent point function.
+
+  JAX implementation of :obj:`scipy.stats.truncnorm` ``ppf``.
+
+  The percent point function is the inverse of the cumulative distribution
+  function, :func:`jax.scipy.stats.truncnorm.cdf`. It is computed in log space
+  with :func:`jax.scipy.special.ndtri_exp`, so it stays accurate for intervals
+  far out in either tail of the normal distribution.
+
+  Args:
+    q: arraylike, value at which to evaluate the PPF
+    a: arraylike, distribution shape parameter
+    b: arraylike, distribution shape parameter
+    loc: arraylike, distribution offset parameter
+    scale: arraylike, distribution scale parameter
+
+  Returns:
+    array of ppf values.
+
+  See Also:
+    - :func:`jax.scipy.stats.truncnorm.cdf`
+    - :func:`jax.scipy.stats.truncnorm.logcdf`
+    - :func:`jax.scipy.stats.truncnorm.sf`
+  """
+  q, a, b, loc, scale = promote_args_inexact("truncnorm.ppf", q, a, b, loc, scale)
+  q, a, b = jnp.broadcast_arrays(q, a, b)
+  valid = (a < b) & (q >= 0) & (q <= 1)
+  q_safe = jnp.where(valid & (q > 0) & (q < 1), q, 0.5)
+  log_q, log1m_q = jnp.log(q_safe), jnp.log1p(-q_safe)
+  # The quantile x satisfies ndtr(x) = (1 - q) * ndtr(a) + q * ndtr(b) and
+  # ndtr(-x) = q * ndtr(-b) + (1 - q) * ndtr(-a). Both right-hand sides are
+  # sums of nonnegative terms, so they can be evaluated in log space without
+  # cancellation. Invert whichever one is at most 1/2 (the CDF in the lower
+  # tail keeps full relative precision), with ndtri_exp.
+  log_phi_left = jnp.logaddexp(log1m_q + _log_ndtr_safe(a),
+                               log_q + _log_ndtr_safe(b))
+  log_phi_right = jnp.logaddexp(log_q + _log_ndtr_safe(-b),
+                                log1m_q + _log_ndtr_safe(-a))
+  use_left = log_phi_left <= -math.log(2)
+  # Give the unused inversion a dummy argument, so that it produces no
+  # non-finite values or gradients.
+  x = jnp.where(
+      use_left,
+      ndtri_exp(jnp.where(use_left, log_phi_left, -1)),
+      -ndtri_exp(jnp.where(use_left, -1, log_phi_right)))
+  # Clip rounding errors, without halving the derivative where x == a or b.
+  x = jnp.where(x < a, a, jnp.where(x > b, b, x))
+  x = jnp.select([~valid, q == 0, q == 1], [np.nan, a, b], x)
+  return lax.add(lax.mul(x, scale), loc)
+
+
+def _log_ndtr_safe(x: Array) -> Array:
+  # log_ndtr, with a zero (rather than nan) derivative at x = -inf.
+  is_neginf = x == -np.inf
+  return jnp.where(is_neginf, -np.inf, log_ndtr(jnp.where(is_neginf, 0, x)))

@@ -403,6 +403,147 @@ class DistributionsTest(RandomTestBase):
     self._CheckKolmogorovSmirnovCDF(samples, scipy.stats.truncnorm(-0.3, 0.3).cdf)
 
   @jtu.sample_product(
+      dtype=jtu.dtypes.floating,
+      bounds=[(5., np.inf), (6., np.inf), (10., np.inf), (8., 8.5),
+              (-10., -8.), (-np.inf, -6.), (3.5, 4.), (40., 41.),
+              (-45., -40.)],
+      use_jit=[False, True],
+  )
+  def testTruncatedNormalTails(self, dtype, bounds, use_jit):
+    # https://github.com/jax-ml/jax/issues/10951: intervals far out in a tail
+    # used to return a bound (or the largest finite float) for every sample.
+    lower, upper = bounds
+    key = self.make_key(0)
+    rand = random.truncated_normal if not use_jit else jax.jit(
+        random.truncated_normal, static_argnames=['shape', 'dtype'])
+    n = 10000
+    samples = rand(key, lower=lower, upper=upper, shape=(n,), dtype=dtype)
+    self.assertEqual(samples.dtype, dtype)
+    samples = np.asarray(samples)
+    self.assertTrue(np.all(samples > lower))
+    self.assertTrue(np.all(samples < upper))
+    dist = scipy.stats.truncnorm(lower, upper)
+    self._CheckKolmogorovSmirnovCDF(samples, dist.cdf)
+    self.assertAllClose(np.mean(samples, dtype=np.float64), dist.mean(),
+                        atol=5 * dist.std() / np.sqrt(n), rtol=0)
+
+  @jtu.sample_product(
+      dtype=[d for d in float_dtypes if dtypes.finfo(d).bits < 32],
+      bounds=[(3., 4.), (6., np.inf), (8., 8.5), (-10., -8.)],
+  )
+  def testTruncatedNormalTailsLowPrecision(self, dtype, bounds):
+    lower, upper = bounds
+    n = 10000
+    samples = random.truncated_normal(
+        self.make_key(0), lower=lower, upper=upper, shape=(n,), dtype=dtype)
+    self.assertEqual(samples.dtype, dtype)
+    samples = np.asarray(samples, np.float64)
+    self.assertTrue(np.all(samples > lower))
+    self.assertTrue(np.all(samples < upper))
+    dist = scipy.stats.truncnorm(lower, upper)
+    ulp = float(np.abs(dist.mean())) * float(dtypes.finfo(dtype).eps)
+    self.assertAllClose(samples.mean(), dist.mean(),
+                        atol=5 * dist.std() / np.sqrt(n) + 2 * ulp, rtol=0)
+
+  @jtu.sample_product(
+      dtype=float_dtypes,
+      bounds=[(-2., 2.), (0., np.inf), (-np.inf, 0.), (-1., 3.), (0.5, 1.),
+              (-3., -1.), (-np.inf, np.inf)],
+      traced_bounds=[False, True],
+  )
+  def testTruncatedNormalMatchesErfInversion(self, dtype, bounds,
+                                             traced_bounds):
+    # Intervals that are not far out in a tail are still sampled by inverting
+    # erf, so their samples are the same as before the log-space method for
+    # tail intervals was added.
+    lower, upper = bounds
+    key = self.make_key(0)
+    shape = (1000,)
+
+    @jax.jit
+    def erf_inversion(key):
+      sqrt2 = np.array(np.sqrt(2), dtype)
+      lo = lax.convert_element_type(lower, dtype)
+      hi = lax.convert_element_type(upper, dtype)
+      u = random.uniform(key, shape, dtype, minval=lax.erf(lo / sqrt2),
+                         maxval=lax.erf(hi / sqrt2))
+      return jnp.clip(sqrt2 * lax.erf_inv(u),
+                      lax.nextafter(lo, np.array(np.inf, dtype)),
+                      lax.nextafter(hi, np.array(-np.inf, dtype)))
+
+    if traced_bounds:
+      rand = jax.jit(random.truncated_normal, static_argnums=(3, 4))
+    else:
+      rand = random.truncated_normal
+    self.assertAllClose(rand(key, lower, upper, shape, dtype),
+                        erf_inversion(key))
+
+  def testTruncatedNormalMixedBounds(self):
+    # Tail and non-tail intervals in one call, directly and under vmap.
+    lower = np.array([-2., 6., 0., -10., -np.inf, 3.5], np.float32)
+    upper = np.array([2., np.inf, 1., -8., -7., 3.6], np.float32)
+    key = self.make_key(0)
+    n = 10000
+    samples = random.truncated_normal(key, lower, upper, shape=(n, 6))
+    samples_vmap = jax.vmap(
+        lambda lo, hi: random.truncated_normal(key, lo, hi, shape=(n,)))(
+            lower, upper)
+    for s in (np.asarray(samples), np.asarray(samples_vmap).T):
+      self.assertTrue(np.all(s > lower))
+      self.assertTrue(np.all(s < upper))
+      for i in range(6):
+        self._CheckKolmogorovSmirnovCDF(
+            s[:, i], scipy.stats.truncnorm(lower[i], upper[i]).cdf)
+    # Gradients under vmap match the unbatched ones.
+    f = lambda lo, hi: random.truncated_normal(key, lo, hi, shape=(8,)).sum()
+    grads = jax.vmap(jax.grad(f, argnums=(0, 1)))(lower, upper)
+    for i in range(6):
+      self.assertAllClose(
+          (grads[0][i], grads[1][i]),
+          jax.grad(f, argnums=(0, 1))(lower[i], upper[i]))
+
+  @jtu.sample_product(
+      dtype=jtu.dtypes.floating,
+      bounds=[(-2., 2.), (0.5, 1.5), (6., np.inf), (8., 8.5), (-10., -8.),
+              (-np.inf, -6.)],
+  )
+  def testTruncatedNormalGrad(self, dtype, bounds):
+    # Holding the uniform draw fixed, a sample x satisfies
+    # cdf(x) = (cdf(lower) * (1 - q) + cdf(upper) * q) for a fixed q, which
+    # gives dx/dlower and dx/dupper by implicit differentiation.
+    lower, upper = bounds
+    key = self.make_key(0)
+    f = lambda lo, hi: random.truncated_normal(key, lo, hi, (64,), dtype)
+    lo, hi = np.array(lower, dtype), np.array(upper, dtype)
+    x = np.asarray(f(lo, hi), np.float64)
+    dlower = jax.jacfwd(f, argnums=0)(lo, hi)
+    dupper = jax.jacrev(f, argnums=1)(lo, hi)
+
+    if lower + upper > 0:  # Evaluate in the lower tail, where it is accurate.
+      x_, a, b = -x, -upper, -lower
+    else:
+      x_, a, b = x, lower, upper
+    log_cdf = scipy.special.log_ndtr
+    log_pdf = scipy.stats.norm.logpdf
+    def log_diff(u, v):
+      return u + np.log(-np.expm1(v - u))
+    log_mass = log_diff(log_cdf(b), log_cdf(a))
+    with np.errstate(divide='ignore'):
+      da = np.exp(log_pdf(a) - log_pdf(x_) +
+                  log_diff(log_cdf(b), log_cdf(x_)) - log_mass)
+      db = np.exp(log_pdf(b) - log_pdf(x_) +
+                  log_diff(log_cdf(x_), log_cdf(a)) - log_mass)
+    expected_dlower, expected_dupper = (db, da) if lower + upper > 0 else (da, db)
+
+    # Exclude samples clamped to a bound.
+    inside = ((x > np.nextafter(lo, np.inf)) & (x < np.nextafter(hi, -np.inf)))
+    rtol = 2e-3 if dtype == np.float32 else 1e-10
+    self.assertAllClose(np.asarray(dlower)[inside], expected_dlower[inside],
+                        check_dtypes=False, rtol=rtol, atol=0)
+    self.assertAllClose(np.asarray(dupper)[inside], expected_dupper[inside],
+                        check_dtypes=False, rtol=rtol, atol=0)
+
+  @jtu.sample_product(
     [dict(shape=shape, replace=replace, axis=axis,
           input_range_or_shape=input_range_or_shape)
       for shape in [(), (5,), (4, 5)]

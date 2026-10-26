@@ -172,6 +172,10 @@ JAX_SPECIAL_FUNCTION_RECORDS = [
         functools.partial(jtu.rand_uniform, low=0.0, high=1.0), True,
     ),
     op_record(
+        "ndtri_exp", 1, float_dtypes,
+        functools.partial(jtu.rand_uniform, low=-20.0, high=-0.05), True,
+    ),
+    op_record(
         "ndtr", 1, float_dtypes, jtu.rand_default, True
     ),
     # TODO(phawkins): gradient of entr yields NaNs.
@@ -496,6 +500,88 @@ class LaxScipySpecialFunctionsTest(jtu.JaxTestCase):
         f(1.0)
       with self.assertRaisesRegex(FloatingPointError, "invalid value \\(inf\\)"):
         f(0.0)
+
+  @staticmethod
+  def _ndtri_exp_reference(y):
+    # scipy.special.ndtri_exp, refined by one Newton step on
+    # log_ndtr(x) - y in float64. scipy's result is accurate to about 1e-12
+    # relative error for y << -700; the Newton step brings it to full float64
+    # precision.
+    y = np.asarray(y, np.float64)
+    with np.errstate(all="ignore"):
+      x = osp_special.ndtri_exp(y)
+      ndtr_over_pdf = np.sqrt(np.pi / 2) * osp_special.erfcx(-x / np.sqrt(2))
+      step = (osp_special.log_ndtr(x) - y) * ndtr_over_pdf
+    return np.where(np.isfinite(step) & (y < -2), x - step, x)
+
+  @jtu.sample_product(dtype=float_dtypes, with_jit=[False, True])
+  def testNdtriExpAccuracy(self, dtype, with_jit):
+    finfo = np.finfo(dtype)
+    log_tiny = np.log(finfo.tiny).astype(dtype)
+    upper_cutoff = np.log1p(-np.exp(-2.0)).astype(dtype)
+    y = np.concatenate([
+        # Start above `tiny`: XLA may flush subnormal inputs to zero.
+        -np.logspace(np.log10(2 * float(finfo.tiny)),
+                     np.log10(float(finfo.max)) - 0.01, 2000),
+        [-1e-20, -1e-10, -0.5, -1.0, -2.0, -10.0, -700.0, -1e10, -1e20,
+         float(-finfo.max)],
+        [np.nextafter(c, d) for c in (log_tiny, upper_cutoff)
+         for d in (-np.inf, np.inf)],
+        [log_tiny, upper_cutoff],
+    ]).astype(dtype)
+    f = jax.jit(lsp_special.ndtri_exp) if with_jit else lsp_special.ndtri_exp
+    actual = f(y)
+    self.assertEqual(actual.dtype, dtype)
+    expected = self._ndtri_exp_reference(y).astype(dtype)
+    rtol = {
+        np.float32: 1e-3 if jtu.test_device_matches(["tpu"]) else 2e-6,
+        np.float64: 1e-14,
+    }[dtype]
+    self.assertAllClose(actual, expected, atol=0, rtol=rtol)
+
+  @jtu.sample_product(dtype=float_dtypes)
+  def testNdtriExpSpecialValues(self, dtype):
+    y = np.array([0.0, -0.0, 1e-30, 1.0, np.inf, -np.inf, np.nan], dtype)
+    expected = np.array([np.inf, np.inf, np.nan, np.nan, np.nan, -np.inf,
+                         np.nan], dtype)
+    self.assertAllClose(lsp_special.ndtri_exp(y), expected)
+    self.assertAllClose(osp_special.ndtri_exp(y.astype(np.float64)),
+                        expected, check_dtypes=False)
+
+  def testNdtriExpMatchesNdtri(self):
+    dtype = jnp.zeros(0).dtype
+    p = np.linspace(0.01, 0.99, 99).astype(dtype)
+    rtol = 1e-3 if jtu.test_device_matches(["tpu"]) else 1e-5
+    self.assertAllClose(lsp_special.ndtri_exp(np.log(p)),
+                        lsp_special.ndtri(p), rtol=rtol, atol=rtol)
+
+  def testNdtriExpTypeError(self):
+    with self.assertRaisesRegex(TypeError, "is not supported"):
+      lsp_special.ndtri_exp(jnp.float16(-1.0))
+
+  @jtu.sample_product(dtype=float_dtypes)
+  def testNdtriExpGrad(self, dtype):
+    # d/dy ndtri_exp(y) = ndtr(x) / norm.pdf(x) with x = ndtri_exp(y).
+    y = -np.logspace(-6, np.log10(float(np.finfo(dtype).max)) - 1, 200)
+    y = y.astype(dtype)
+    x = self._ndtri_exp_reference(y)
+    expected = np.sqrt(np.pi / 2) * osp_special.erfcx(-x / np.sqrt(2))
+    actual = jax.vmap(jax.grad(lsp_special.ndtri_exp))(y)
+    rtol = {
+        np.float32: 1e-3 if jtu.test_device_matches(["tpu"]) else 2e-5,
+        np.float64: 1e-12,
+    }[dtype]
+    self.assertAllClose(actual, expected.astype(dtype), atol=0, rtol=rtol)
+    self.assertEqual(jax.grad(lsp_special.ndtri_exp)(dtype(-np.inf)), 0)
+    self.assertEqual(jax.grad(lsp_special.ndtri_exp)(dtype(0)), np.inf)
+
+  @parameterized.parameters([-0.05, -0.5, -3.0, -50.0, -800.0, -1e5])
+  def testNdtriExpHigherOrderGrads(self, y):
+    dtype = jnp.zeros(0).dtype
+    tol = 1e-2 if dtype == np.float32 else 1e-5
+    jtu.check_grads(lsp_special.ndtri_exp, (np.array(y, dtype),), order=2,
+                    modes=["fwd", "rev"], atol=tol, rtol=tol,
+                    eps=1e-3 if dtype == np.float32 else 1e-6)
 
   def testErfcinvExtremeValues(self):
     dtype = jnp.zeros(0).dtype

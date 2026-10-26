@@ -20,6 +20,7 @@ from jax._src.scipy.stats.truncnorm import (
   logcdf as logcdf,
   logpdf as logpdf,
   pdf as pdf,
+  ppf as ppf,
   logsf as logsf,
   sf as sf
 )

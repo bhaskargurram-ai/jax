@@ -1166,8 +1166,52 @@ class LaxBackedScipyStatsTests(jtu.JaxTestCase):
       self._CheckAgainstNumpy(scipy_fun, lax_fun, args_maker, check_dtypes=False,
                               tol=1e-3)
 
+  @genNamedParametersNArgs(5)
+  def testTruncnormPpf(self, shapes, dtypes):
+    rng = jtu.rand_default(self.rng())
+    rng_uniform = jtu.rand_uniform(self.rng(), low=0.0, high=1.0)
+    scipy_fun = osp_stats.truncnorm.ppf
+    lax_fun = lsp_stats.truncnorm.ppf
+
+    def args_maker():
+      q = rng_uniform(shapes[0], dtypes[0])
+      a, b, loc, scale = map(rng, shapes[1:], dtypes[1:])
+
+      # clipping to ensure that scale is not too low
+      scale = np.clip(np.abs(scale), a_min=0.1, a_max=None).astype(scale.dtype)
+      return [q, a, b, loc, scale]
+
+    with jtu.strict_promotion_if_dtypes_match(dtypes):
+      self._CheckAgainstNumpy(scipy_fun, lax_fun, args_maker, check_dtypes=False,
+                              tol=1e-3)
+      self._CompileAndCheck(lax_fun, args_maker, rtol=1e-4)
+
   @jtu.sample_product(
-    fun=["logpdf", "pdf", "cdf", "sf", "logcdf", "logsf"],
+    bounds=[(-2., 2.), (0., np.inf), (-np.inf, 0.), (-np.inf, np.inf),
+            (0.5, 1.5), (6., np.inf), (8., 8.5), (-10., -8.), (-np.inf, -6.),
+            (40., 41.), (-45., -40.)],
+    dtype=jtu.dtypes.floating,
+  )
+  def testTruncnormPpfTails(self, bounds, dtype):
+    # truncnorm.ppf is computed in log space, so it stays accurate for
+    # intervals far out in either tail (https://github.com/jax-ml/jax/issues/10951).
+    a, b = bounds
+    q = np.array([0., 1e-10, 1e-3, 0.1, 0.5, 0.9, 1 - 1e-3, 1.], dtype)
+    expected = osp_stats.truncnorm.ppf(q.astype(np.float64), a, b)
+    actual = lsp_stats.truncnorm.ppf(q, dtype(a), dtype(b))
+    rtol = 1e-13 if dtype == np.float64 else 1e-5
+    self.assertAllClose(actual, expected.astype(dtype), rtol=rtol, atol=rtol)
+    # The derivative with respect to q is 1 / pdf(ppf(q)).
+    q = q[1:-1]
+    x = osp_stats.truncnorm.ppf(q.astype(np.float64), a, b)
+    expected_grad = np.exp(-osp_stats.truncnorm.logpdf(x, a, b))
+    actual_grad = jax.vmap(jax.grad(lsp_stats.truncnorm.ppf))(
+        q, jnp.full_like(q, a), jnp.full_like(q, b))
+    rtol = 1e-10 if dtype == np.float64 else 1e-3
+    self.assertAllClose(actual_grad, expected_grad.astype(dtype), rtol=rtol)
+
+  @jtu.sample_product(
+    fun=["logpdf", "pdf", "cdf", "sf", "logcdf", "logsf", "ppf"],
     dtype=jtu.dtypes.floating,
   )
   def testTruncnormNanPropagation(self, fun, dtype):

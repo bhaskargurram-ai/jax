@@ -210,6 +210,7 @@ jax.scipy.special
    multigammaln
    ndtr
    ndtri
+   ndtri_exp
    owens_t
    poch
    polygamma
@@ -509,6 +510,7 @@ jax.scipy.stats.truncnorm
    logpdf
    logsf
    pdf
+   ppf
    sf
 
 jax.scipy.stats.uniform

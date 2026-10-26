@@ -23,6 +23,9 @@ When releasing, please add the new-release-boilerplate to docs/pallas/CHANGELOG.
   * Added {func}`jax.scipy.special.gammaincinv` and
     {func}`jax.scipy.special.gammainccinv`, the inverses of the regularized
     incomplete gamma functions, with gradients with respect to both arguments.
+  * Added {func}`jax.scipy.special.ndtri_exp`, the inverse of
+    {func}`jax.scipy.special.log_ndtr`, and
+    {func}`jax.scipy.stats.truncnorm.ppf`.
 
 * Deprecations
   * The `jax_use_shardy_partitioner` configuration flag is deprecated and is now
@@ -38,6 +41,15 @@ When releasing, please add the new-release-boilerplate to docs/pallas/CHANGELOG.
     boolean outputs, which is much faster for long axes ({jax-issue}`#28097`).
 
 * Bug fixes
+  * {func}`jax.random.truncated_normal` now returns correct samples for
+    intervals far out in either tail of the normal distribution, such as
+    `[6, inf)` or `[-10, -8]` in float32, which previously returned a bound
+    or the largest finite float for every sample ({jax-issue}`#10951`).
+    Samples for a fixed key change only for intervals that lie entirely beyond
+    about 3.4 standard deviations from zero in float32 (5.5 in float64). Other
+    intervals, such as the `(-2, 2)` used by
+    {func}`jax.nn.initializers.truncated_normal`, give the same samples as
+    before.
   * {func}`jax.scipy.linalg.polar` with `method="qdwh"` now honors
     `max_iterations` and accepts `eps`, as documented; previously
     `max_iterations` was silently ignored and any `eps` raised a `ValueError`.

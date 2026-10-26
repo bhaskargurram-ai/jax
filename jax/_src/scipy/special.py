@@ -2432,7 +2432,7 @@ def log_ndtr(x: ArrayLike, series_order: int = 3) -> Array:
 
 def _log_ndtr_jvp(series_order, primals, tangents):
   (x,), (t,) = primals, tangents
-  ans = log_ndtr(x, series_order=series_order)
+  ans = log_ndtr(x, series_order)
   t_out = lax.mul(t, lax.exp(lax.sub(_norm_logpdf(x), ans)))
   return ans, t_out
 log_ndtr.defjvp(_log_ndtr_jvp)
@@ -2476,6 +2476,116 @@ def _norm_logpdf(x):
   neg_half = _lax_const(x, -0.5)
   log_normalizer = _lax_const(x, _norm_logpdf_constant)
   return lax.sub(lax.mul(neg_half, lax.square(x)), log_normalizer)
+
+
+def ndtri_exp(y: ArrayLike) -> Array:
+  r"""Inverse of :func:`~jax.scipy.special.log_ndtr`.
+
+  JAX implementation of :obj:`scipy.special.ndtri_exp`.
+
+  Returns ``x`` such that ``log_ndtr(x) == y``. Mathematically this is
+  ``ndtri(exp(y))``, but ``ndtri_exp`` stays accurate where that expression
+  does not: for very negative ``y``, where ``exp(y)`` underflows, and for
+  ``y`` close to zero, where ``exp(y)`` rounds to one.
+
+  .. math::
+
+    \mathrm{ndtri\_exp}(y) = \Phi^{-1}(e^y), \qquad y \le 0
+
+  where :math:`\Phi` is the standard normal CDF, :func:`~jax.scipy.special.ndtr`.
+
+  Args:
+    y: an array of type `float32` or `float64`. Values greater than zero
+      return ``nan``.
+
+  Returns:
+    an array with `dtype=y.dtype`.
+
+  Raises:
+    TypeError: if `y` is not of type `float32` or `float64`.
+
+  See also:
+    - :func:`jax.scipy.special.ndtri`
+    - :func:`jax.scipy.special.log_ndtr`
+  """
+  y, = promote_args_inexact("ndtri_exp", y)
+  dtype = lax.dtype(y)
+  if dtype not in (np.float32, np.float64):
+    raise TypeError(
+        f"y.dtype={np.dtype(dtype)} is not supported, see docstring for "
+        "supported types.")
+  return _ndtri_exp(y)
+
+
+@custom_derivatives.custom_jvp
+def _ndtri_exp(y: Array) -> Array:
+  dtype = lax.dtype(y)
+  finfo = np.finfo(dtype)
+  # The input range is split into three pieces:
+  # - Near zero, `exp(y)` rounds to one, so use `-ndtri(-expm1(y))`. The cutoff
+  #   `log1p(-exp(-2))` is the one used by `scipy.special.ndtri_exp`.
+  # - In the middle, `ndtri(exp(y))` is accurate as long as `exp(y)` is a
+  #   normal floating point number.
+  # - Below `log(tiny)`, `exp(y)` underflows. There, invert the asymptotic
+  #   expansion of `log_ndtr` instead (see below).
+  upper_cutoff = np.log1p(-np.exp(-2.0)).astype(dtype)
+  lower_cutoff = np.log(finfo.tiny).astype(dtype)
+  is_upper = y > upper_cutoff
+  is_lower = y <= lower_cutoff
+
+  # Upper and middle pieces share a single call to `ndtri`.
+  y_mid = jnp.where(is_lower, lower_cutoff, y)
+  p = jnp.where(is_upper, -lax.expm1(y_mid), lax.exp(y_mid))
+  x_ndtri = _ndtri(p)
+  x_mid = jnp.where(is_upper, -x_ndtri, x_ndtri)
+
+  # Lower piece. Since `log_ndtr(x) = log(norm_pdf(x)) - log(-x) + log(s(x))`
+  # with the asymptotic series `s(x) = 1 - 1/x^2 + 3/x^4 - ...`, `u = x^2`
+  # satisfies `u = 2h - log(2*pi*u) - 2/u + O(1/u^2)` where `h = -y`. Two
+  # fixed-point iterations from `u = 2h` give `x` with a relative error below
+  # `1e-6` (`float32`) or `1e-9` (`float64`), and one Newton step on
+  # `log_ndtr(x) - y` then reaches full precision. Iterating on `u / 2`
+  # rather than `u` keeps everything finite for `y` near `-finfo.max`. For
+  # `h > 1/eps` the fixed point is already exact to working precision;
+  # skipping Newton there also keeps `x^2` finite.
+  h = jnp.where(is_lower & (y > -np.inf), -y, -lower_cutoff)
+  log_4pi = np.array(np.log(4 * np.pi), dtype)
+  half_u = h
+  for _ in range(2):
+    half_u = h - 0.5 * (log_4pi + lax.log(half_u)) - 0.5 / half_u
+  x_lower = -np.sqrt(2).astype(dtype) * lax.sqrt(half_u)
+  # Here `x < -13` (`float32`) or `x < -37` (`float64`), where the series
+  # `s(x)` with 8 terms is accurate to working precision; it gives both
+  # `log_ndtr(x)` and `ndtr(x) / norm_pdf(x) = s(x) / (-x)`.
+  use_newton = h < 1 / finfo.eps
+  x_newton = jnp.where(use_newton, x_lower, lower_cutoff)
+  s = _log_ndtr_asymptotic_series(x_newton, 8)
+  log_ndtr_x = (_norm_logpdf(x_newton) - lax.log(-x_newton)) + lax.log(s)
+  x_newton = x_newton - (log_ndtr_x + h) * (s / -x_newton)
+  x_lower = jnp.where(use_newton, x_newton, x_lower)
+
+  x = jnp.where(is_lower, x_lower, x_mid)
+  with config.debug_nans(False), config.debug_infs(False):
+    x = jnp.where(y == -np.inf, -np.inf, x)
+    x = jnp.where(jnp.isnan(y) | (y > 0), np.nan, x)
+  return x
+
+
+@_ndtri_exp.defjvp
+def _ndtri_exp_jvp(primals, tangents):
+  (y,), (y_dot,) = primals, tangents
+  x = _ndtri_exp(y)
+  # d/dy ndtri_exp(y) = 1 / (d/dx log_ndtr(x)) = ndtr(x) / norm_pdf(x).
+  return x, y_dot * _ndtr_over_norm_pdf(x)
+
+
+def _ndtr_over_norm_pdf(x: Array) -> Array:
+  # `ndtr(x) / norm_pdf(x) = sqrt(pi/2) * erfcx(-x/sqrt(2))` (the Mills ratio
+  # of `-x`), which stays accurate in the lower tail where both `ndtr(x)` and
+  # `norm_pdf(x)` underflow.
+  dtype = lax.dtype(x)
+  return (np.sqrt(np.pi / 2).astype(dtype) *
+          _erfcx(-x * np.sqrt(0.5).astype(dtype)))
 
 
 def i0e(x: ArrayLike) -> Array:
