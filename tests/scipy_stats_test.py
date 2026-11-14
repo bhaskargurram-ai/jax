@@ -798,6 +798,17 @@ class LaxBackedScipyStatsTests(jtu.JaxTestCase):
       self._CompileAndCheck(lax_fun, args_maker, atol={np.float32: 3e-5},
                             rtol={np.float32: 3e-5})
 
+  @jtu.sample_product(dtype=jtu.dtypes.floating)
+  def testGenNormCdfLowerTail(self, dtype):
+    # Small lower-tail probabilities must not round to zero.
+    x = np.array([-3., -6., -2., -30., -40.], dtype=dtype)
+    beta = np.array([2., 2., 4., 1., 1.], dtype=dtype)
+    expected = osp_stats.gennorm.cdf(x.astype(np.float64),
+                                     beta.astype(np.float64))
+    rtol = {np.float32: 1e-5, np.float64: 1e-12}
+    self.assertAllClose(lsp_stats.gennorm.cdf(x, beta), expected.astype(dtype),
+                        rtol=rtol, atol=0)
+
   @genNamedParametersNArgs(4)
   def testNBinomLogPmf(self, shapes, dtypes):
     rng = jtu.rand_positive(self.rng())

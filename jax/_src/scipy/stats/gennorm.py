@@ -13,6 +13,7 @@
 # limitations under the License.
 
 from jax._src import lax
+from jax._src import numpy as jnp
 from jax._src.numpy.util import promote_args_inexact
 from jax._src.typing import Array, ArrayLike
 
@@ -72,7 +73,10 @@ def cdf(x: ArrayLike, beta: ArrayLike) -> Array:
     - :func:`jax.scipy.stats.gennorm.logpdf`
   """
   x, beta = promote_args_inexact("gennorm.cdf", x, beta)
-  return .5 * (1 + lax.sign(x) * lax.igamma(1/beta, lax.abs(x)**beta))
+  # Compute the tail mass beyond |x| with igammac, so that small lower-tail
+  # probabilities are not lost to cancellation in 1 - igamma.
+  half_tail = .5 * lax.igammac(1/beta, lax.abs(x)**beta)
+  return jnp.where(x < 0, half_tail, 1 - half_tail)
 
 
 def pdf(x: ArrayLike, beta: ArrayLike) -> Array:
