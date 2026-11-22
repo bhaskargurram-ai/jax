@@ -894,6 +894,32 @@ class LaxScipySpecialFunctionsTest(jtu.JaxTestCase):
       )
 
   @jtu.sample_product(dtype=float_dtypes)
+  def testHyp2f1Accuracy(self, dtype):
+    # Points where the Euler-transformed series cancels (c - a or c - b large
+    # and negative) or where the series in x converges too slowly (x close to
+    # 1). The inputs are exact in float32; reference values from mpmath.
+    a, b, c, x, expected = map(np.array, zip(*[
+        (0.015625, 48.5, 12.25, 0.59375, 2080.144519350806),
+        (48.5, 0.1875, 8.75, 0.84375, 3.0493333663420113e+22),
+        (45.5, 0.25, 6.5, 0.5, 332953.82715142211),
+        (36.75, 0.015625, 21.0, 0.6875, 1.1334033011542523),
+        (33.5, 0.03125, 23.25, 0.875, 3.5318462229682426),
+        (0.8125, 0.0625, 0.0078125, 1 - 2**-13, 19412.528282392928),
+        (0.25, 0.5, 0.03125, 1 - 2**-8, 327.5717096839686),
+        (0.0078125, 0.625, 0.015625, 0.98828125, 8.3334506362608326),
+        (1.5, 2.5, 3.25, 1 - 2**-10, 471.50043897097817),
+        (3.5, 1.25, 4.0, 0.9921875, 86.571093015628634),
+    ]))
+    args_maker = lambda: [v.astype(dtype) for v in (a, b, c, x)]
+    if jtu.test_device_matches(["tpu"]):
+      rtol = 1e-3
+    else:
+      rtol = {np.float32: 5e-5, np.float64: 1e-12}
+    self.assertAllClose(lsp_special.hyp2f1(*args_maker()),
+                        expected.astype(dtype), rtol=rtol)
+    self._CompileAndCheck(lsp_special.hyp2f1, args_maker, rtol=rtol)
+
+  @jtu.sample_product(dtype=float_dtypes)
   def testHyp2f1ParameterDerivatives(self, dtype):
     a = np.array([0.15, 5.0], dtype=dtype)
     b = np.array([0.25, 3.0], dtype=dtype)

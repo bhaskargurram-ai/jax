@@ -4325,19 +4325,30 @@ def _hyp2f1_terminal(a, b, c, x):
   a = jnp.abs(a)
 
   def body(i, state):
-    serie, term = state
+    serie, term, umax = state
 
     term *= -(a - i + 1) / (c + i - 1) * (b + i - 1) / i * x
     serie += term
+    umax = lax.max(umax, lax.abs(term))
 
-    return serie, term
+    return serie, term, umax
 
-  init = (jnp.array(1, dtype=x.dtype), jnp.array(1, dtype=x.dtype))
+  init = (jnp.array(1, dtype=x.dtype), jnp.array(1, dtype=x.dtype),
+          jnp.array(1, dtype=x.dtype))
 
-  return lax.fori_loop(jnp.array(1, dtype=a.dtype),
-                       a + 1,
-                       body,
-                       init)[0]
+  serie, _, umax = lax.fori_loop(jnp.array(1, dtype=a.dtype),
+                                 a + 1,
+                                 body,
+                                 init)
+  # Estimate of the relative error, as for _hyp2f1_serie.
+  loss = dtypes.finfo(x.dtype).eps * (umax / lax.abs(serie) + a + 1)
+  return serie, loss
+
+
+def _hyp2f1_max_loss(dtype):
+  # Error estimate above which a series result is replaced by an alternative
+  # with a smaller estimate; about 1e-12 for float64, as in Cephes.
+  return dtypes.finfo(dtype).eps * 4096
 
 
 def _hyp2f1_serie(a, b, c, x):
@@ -4345,28 +4356,118 @@ def _hyp2f1_serie(a, b, c, x):
   Compute the 2F1 hypergeometric function using the Taylor expansion.
   See Eq. 4.1 from PEARSON, OLVER & PORTER 2014
   https://doi.org/10.48550/arXiv.1407.7786
+
+  Also returns an estimate of the relative error of the sum, as in Cephes'
+  ``hys2f1``: ``eps * (max_k |term_k| / |sum| + number of terms)``, plus an
+  estimate of the truncation error if the series has not converged.
   """
   rtol = dtypes.finfo(x.dtype).eps
 
   def body(state):
-    serie, k, term = state
+    serie, k, term, umax = state
 
     serie += term
+    umax = lax.max(umax, lax.abs(term))
     term *= (a + k - 1) * (b + k - 1) / (c + k - 1) / k * x
     k += 1
 
-    return serie, k, term
+    return serie, k, term, umax
 
   def cond(state):
-    serie, k, term = state
+    serie, k, term, _ = state
 
     return (k < 250) & (lax.abs(term) > rtol * lax.abs(serie))
 
   init = (jnp.array(0, dtype=x.dtype),
           jnp.array(1, dtype=x.dtype),
-          jnp.array(1, dtype=x.dtype))
+          jnp.array(1, dtype=x.dtype),
+          jnp.array(0, dtype=x.dtype))
 
-  return lax.while_loop(cond, body, init)[0]
+  serie, k, term, umax = lax.while_loop(cond, body, init)
+  loss = rtol * (umax / lax.abs(serie) + k)
+  # If the loop stopped before convergence, bound the rest of the sum by a
+  # geometric series with the larger of |x| and the next term ratio.
+  ratio = lax.max(
+      lax.abs((a + k - 1) * (b + k - 1) / (c + k - 1) / k * x), lax.abs(x))
+  ratio = lax.min(ratio, _lax_const(x, 0.999))
+  truncation = lax.abs(term) / (lax.abs(serie) * (1 - ratio))
+  converged = lax.abs(term) <= rtol * lax.abs(serie)
+  return serie, jnp.where(converged, loss, loss + truncation)
+
+
+def _hyp2f1_serie_or_recurrence(a, b, c, x):
+  """
+  Taylor expansion of 2F1, or, when ``|a|`` is much larger than ``|c|``, a
+  two-term recurrence in ``a`` started from the expansion at ``a - da`` and
+  ``a - da +/- 1`` (AMS55 #15.2.10). For such parameters the terms of the
+  series can alternate in sign and be much larger than its sum, so summing
+  them directly loses all accuracy. Follows ``hys2f1`` and ``hyp2f1ra`` in
+  Cephes, except that the recurrence is only used for ``c > 0`` (it is not
+  stable for every ``c < 0``) and only when its error estimate is smaller than
+  that of the direct sum.
+
+  Returns the value and an estimate of its relative error.
+  """
+  swap = lax.abs(b) > lax.abs(a)
+  a, b = jnp.where(swap, b, a), jnp.where(swap, a, b)
+
+  use_recurrence = ((lax.abs(a) > c + 1) & (lax.abs(c - a) > 2) &
+                    (lax.abs(a) > 2) & (c > 0) & (x != 0))
+  # Start from a - da close to c or to zero, without crossing either.
+  da = jnp.where(use_recurrence,
+                 jnp.where(a >= c, jnp.round(a - c), jnp.round(a)), 0)
+  too_far = lax.abs(da) > 10000
+  down = da < 0
+  t = a - da
+
+  serie, serie_loss = _hyp2f1_serie(a, b, c, x)
+  x_rec = jnp.where(use_recurrence, x, 0)
+  f1, loss1 = _hyp2f1_serie(t, b, c, x_rec)
+  f0, loss0 = _hyp2f1_serie(jnp.where(down, t - 1, t + 1), b, c, x_rec)
+
+  def body(_, state):
+    t, f0, f1 = state
+    f2, f1 = f1, f0
+    t = jnp.where(down, t - 1, t + 1)
+    u = 2 * t - c - t * x + b * x
+    f0 = jnp.where(down,
+                   -(u * f1 + t * (x - 1) * f2) / (c - t),
+                   -(u * f1 + (c - t) * f2) / (t * (x - 1)))
+    return t, f0, f1
+
+  num_steps = jnp.where(use_recurrence & ~too_far, lax.abs(da) - 1, 0)
+  _, f0, _ = lax.fori_loop(0, num_steps.astype(np.int32), body, (t, f0, f1))
+
+  use_recurrence &= (~too_far & (serie_loss > _hyp2f1_max_loss(x.dtype)) &
+                     (loss0 + loss1 < serie_loss))
+  return (jnp.where(use_recurrence, f0, serie),
+          jnp.where(use_recurrence, loss0 + loss1, serie_loss))
+
+
+def _hyp2f1_near_one(a, b, c, x):
+  """
+  Linear transformation of 2F1 to argument ``1 - x`` for non-integer
+  ``d = c - a - b``, AMS55 #15.3.6. Used for ``x`` close to 1, where the
+  Taylor expansion in ``x`` converges too slowly.
+  """
+  d = c - a - b
+  s = 1 - x
+  s_safe = jnp.where(s > 0, s, 1)
+
+  q, q_loss = _hyp2f1_serie(a, b, 1 - d, s)
+  r, r_loss = _hyp2f1_serie(c - a, c - b, d + 1, s)
+
+  lgamma_c = lax.lgamma(c)
+  q *= (gammasgn(c) * gammasgn(d) * gammasgn(c - a) * gammasgn(c - b) *
+        lax.exp(lgamma_c + lax.lgamma(d) - lax.lgamma(c - a) -
+                lax.lgamma(c - b)))
+  r *= (s_safe ** d * gammasgn(c) * gammasgn(-d) * gammasgn(a) * gammasgn(b) *
+        lax.exp(lgamma_c + lax.lgamma(-d) - lax.lgamma(a) - lax.lgamma(b)))
+  value = q + r
+  # The two terms can cancel, e.g. when d is close to an integer.
+  cancellation = lax.max(lax.abs(q), lax.abs(r)) / lax.abs(value)
+  loss = q_loss + r_loss + dtypes.finfo(x.dtype).eps * cancellation
+  return value, loss
 
 
 def _hyp2f1_terminal_or_serie(a, b, c, x, log_gamma_ratio, sgn_gamma_ratio):
@@ -4376,6 +4477,9 @@ def _hyp2f1_terminal_or_serie(a, b, c, x, log_gamma_ratio, sgn_gamma_ratio):
   relation may still be approximated.
   See 4.6.1. Recurrence Relations from PEARSON, OLVER & PORTER 2014
   https://doi.org/10.48550/arXiv.1407.7786
+
+  Returns the value and an estimate of its relative error (zero for the
+  digamma expansion).
   """
   eps = dtypes.finfo(x.dtype).eps * 50
 
@@ -4390,16 +4494,31 @@ def _hyp2f1_terminal_or_serie(a, b, c, x, log_gamma_ratio, sgn_gamma_ratio):
   neg_int_a_or_b = jnp.logical_or(neg_int_a, neg_int_b)
   not_neg_int_a_or_b = jnp.logical_not(neg_int_a_or_b)
 
+  serie, loss = _hyp2f1_serie_or_recurrence(a, b, c, x)
+  # For x > 0.9 the Taylor expansion may converge too slowly. Then, as in
+  # Cephes, fall back to the transformation to 1 - x, if that is more accurate
+  # by the error estimates.
+  try_near_one = (x > 0.9) & not_neg_int_a_or_b & (jnp.abs(d - id) >= eps) & (
+      loss > _hyp2f1_max_loss(x.dtype))
+  near_one_value, near_one_loss = _hyp2f1_near_one(
+      a, b, c, jnp.where(try_near_one, x, 1))
+  near_one = try_near_one & (near_one_loss < loss)
+
   index = jnp.where(jnp.logical_and(x > 0.9, not_neg_int_a_or_b),
-        jnp.where(jnp.abs(d - id) >= eps, 0, 1),
+        jnp.where(jnp.abs(d - id) >= eps, jnp.where(near_one, 3, 0), 1),
         jnp.where(neg_int_a_or_b, 2, 0))
 
-  return lax.select_n(index,
-                      _hyp2f1_serie(a, b, c, x),
-                      _hyp2f1_digamma_transform(
-                          a, b, c, x, log_gamma_ratio, sgn_gamma_ratio
-                      ),
-                      _hyp2f1_terminal(a, b, c, x))
+  terminal, terminal_loss = _hyp2f1_terminal(a, b, c, x)
+  value = lax.select_n(index,
+                       serie,
+                       _hyp2f1_digamma_transform(
+                           a, b, c, x, log_gamma_ratio, sgn_gamma_ratio
+                       ),
+                       terminal,
+                       near_one_value)
+  loss = lax.select_n(index, loss, jnp.zeros_like(loss), terminal_loss,
+                      near_one_loss)
+  return value, loss
 
 
 def _hyp2f1_digamma_transform(a, b, c, x, log_gamma_ratio, sgn_gamma_ratio):
@@ -4629,9 +4748,17 @@ def _hyp2f1(a: Array, b: Array, c: Array, x: Array) -> Array:
   gb_arg = jnp.where(use_euler | use_gauss, cb, b)
   log_gamma_ratio = lax.lgamma(c) - lax.lgamma(ga_arg) - lax.lgamma(gb_arg)
   sgn_gamma_ratio = gammasgn(c) * gammasgn(ga_arg) * gammasgn(gb_arg)
-  term_or_serie = _hyp2f1_terminal_or_serie(
+  term_or_serie, term_or_serie_loss = _hyp2f1_terminal_or_serie(
       a_eff, b_eff, c, x, log_gamma_ratio, sgn_gamma_ratio
   )
+  # Euler's transformation speeds up the convergence of the series, but when
+  # c - a or c - b is large and negative the transformed series alternates in
+  # sign and cancels. Then sum the original series if that is more accurate.
+  direct, direct_loss = _hyp2f1_serie_or_recurrence(
+      a, b, c, jnp.where(use_euler, x, 0))
+  use_direct = ((term_or_serie_loss > _hyp2f1_max_loss(x.dtype)) &
+                (direct_loss < term_or_serie_loss))
+  euler = jnp.where(use_direct, direct, s ** d * term_or_serie)
   gauss_val = (
       sgn_gamma_ratio * gammasgn(d) * lax.exp(log_gamma_ratio + lax.lgamma(d))
   )
@@ -4639,7 +4766,7 @@ def _hyp2f1(a: Array, b: Array, c: Array, x: Array) -> Array:
   return lax.select_n(index,
                       jnp.array(1, dtype=x.dtype),
                       jnp.array(np.inf, dtype=x.dtype),
-                      s ** d * term_or_serie,
+                      euler,
                       s ** (-a),
                       s ** (-b),
                       gauss_val,
